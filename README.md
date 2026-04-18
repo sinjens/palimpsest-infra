@@ -2,6 +2,12 @@
 
 Persistent, scope-aware memory for Claude Code — conversation logs routed across multiple git-backed "brains", with write-time secrets redaction and a path toward an LLM-compiled curated knowledge base.
 
+## Why "palimpsest"?
+
+A **palimpsest** (Greek *palimpsēstos*, "scraped clean again") is a parchment or manuscript that has been written on, scraped off, and written on again — often with traces of the earlier text still visible beneath the new writing. In medieval scriptoria, where vellum was expensive, scribes routinely erased old texts to reuse the surface; modern archaeologists and philologists have since recovered the ghosted layers of lost works that would otherwise have vanished.
+
+The name fits this project because the curated memory layer is meant to *evolve*. Articles get rewritten as knowledge refreshes, TTLs expire, and new context replaces outdated claims — but the underlying strata are never destroyed. Git history preserves every prior version; raw conversation logs stay immutable beneath; the live surface always reflects the current best understanding. The palimpsest is what grows on top.
+
 ## What this is
 
 Every Claude Code session on your machine gets:
