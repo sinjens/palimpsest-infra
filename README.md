@@ -113,6 +113,21 @@ Pulls and pushes work transparently. The hooks don't know or care which server t
 - Small team, strong company-confidentiality policies → private `github.com` or GHES; managed routines still work directly.
 - Regulated industries (finance / defense / healthcare where even the *existence* of the repo is sensitive) → self-host, and run the compile loop on your own infrastructure, not Anthropic's.
 
+### ⚠️ "Private" is relative
+
+A private GitHub repo means no public read access and — per GitHub's current policy — no training on its contents at rest. But using GitHub still means your data lives on Microsoft-owned Azure infrastructure, is accessible to GitHub employees under policy-bounded circumstances (abuse investigation, legal response, support), subject to US legal processes, and present in GitHub's backup systems for some period after you delete.
+
+Starting **April 24, 2026**, GitHub also trains on **Copilot interaction data** (prompts, suggestions, code snippets, surrounding context) from Copilot **Free / Pro / Pro+** users *by default*. Opt-out is in Settings → Privacy. Copilot **Business** and **Enterprise** are not affected. This policy covers interaction data generated while you work — including inside private repos — but **not** the repo contents at rest. If you run Copilot while editing files in a palimpsest brain repo and haven't opted out, the autocompletions on those files are collected.
+
+For most personal use on a private GitHub repo, this is a manageable risk. But if the data in your brains is ever legally, contractually, or ethically sensitive enough that a Microsoft-managed third party seeing it would be a problem, consider:
+
+- A **self-hosted git server** — Gitea, Forgejo, GitLab CE, Bitbucket Server. See the section above.
+- **Fully local with no remote** — `git init` and never add an origin. You lose cross-device sync but nothing leaves your machine. Palimpsest's auto-sync silently no-ops without a remote, so everything else still works.
+
+Sources:
+- [Updates to GitHub's Privacy Statement and Terms of Service (2026-03-25)](https://github.blog/changelog/2026-03-25-updates-to-our-privacy-statement-and-terms-of-service-how-we-use-your-data/)
+- [GitHub Privacy Statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement)
+
 ## Scope resolution
 
 In order, first match wins:
