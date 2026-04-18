@@ -128,6 +128,8 @@ Sources:
 - [Updates to GitHub's Privacy Statement and Terms of Service (2026-03-25)](https://github.blog/changelog/2026-03-25-updates-to-our-privacy-statement-and-terms-of-service-how-we-use-your-data/)
 - [GitHub Privacy Statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement)
 
+*The summary above reflects GitHub's stated policies as of 2026-04-19. Policies change — before relying on any specific claim here, re-check the current [GitHub Privacy Statement](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement) and [GitHub Blog — Changelog](https://github.blog/changelog/) for what applies to your account and plan.*
+
 ## Scope resolution
 
 In order, first match wins:
