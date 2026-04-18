@@ -82,6 +82,18 @@ _REDACTION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[A-Za-z0-9+/=]+[^;\s\"]*"),
                                                                          "[REDACTED:AZURE_CONN_STRING]"),
     (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{20,}"),               "bearer [REDACTED:TOKEN]"),
+    # Payment / messaging provider keys
+    (re.compile(r"(?:sk|rk|pk)_live_[0-9A-Za-z]{24,}"),                   "[REDACTED:STRIPE_KEY]"),
+    (re.compile(r"SK[0-9a-f]{32}"),                                       "[REDACTED:TWILIO_KEY]"),
+    (re.compile(r"SG\.[A-Za-z0-9_-]{16,32}\.[A-Za-z0-9_-]{32,}"),          "[REDACTED:SENDGRID_KEY]"),
+    (re.compile(r"hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]+"), "[REDACTED:SLACK_WEBHOOK]"),
+    # Cloud provider / infra tokens
+    (re.compile(r"dop_v1_[a-f0-9]{64}"),                                  "[REDACTED:DIGITALOCEAN_TOKEN]"),
+    (re.compile(r"dapi[a-f0-9]{32}"),                                     "[REDACTED:DATABRICKS_TOKEN]"),
+    # Basic-auth or connection-string URLs with embedded credentials.
+    # Matches scheme://user:password@host  (common for db / repo URLs).
+    (re.compile(r"\b(?:https?|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?|ftp|ssh|git)://[^\s:/@]+:[^\s/@]+@[A-Za-z0-9.\-]+"),
+                                                                         r"[REDACTED:URL_WITH_CREDS]"),
 ]
 
 _SCOPE_PREFIXES = {
@@ -133,7 +145,8 @@ def main() -> int:
         if text.strip():
             claude_text = _redact(text)
         try:
-            jsonl_content = _redact(Path(transcript_path).read_text(encoding="utf-8"))
+            raw_jsonl = Path(transcript_path).read_text(encoding="utf-8")
+            jsonl_content = _redact(_sanitize_jsonl(raw_jsonl, config.get("log_tool_calls", "none")))
         except OSError:
             pass
 
@@ -206,6 +219,7 @@ def _load_config() -> dict:
         "brains": data.get("brains", {}) or {},
         "unclassified_path": data.get("unclassified_path"),
         "auto_sync": data.get("auto_sync", True),
+        "log_tool_calls": data.get("log_tool_calls", "none"),
     }
 
 
@@ -527,6 +541,84 @@ def _redact(text: str) -> str:
     for pattern, replacement in _REDACTION_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
+
+
+def _sanitize_jsonl(raw: str, mode: str) -> str:
+    """Filter tool_use / tool_result content from the raw transcript
+    according to `log_tool_calls` mode.
+
+        "none"    (default) — strip tool_use and tool_result blocks entirely.
+                              ExitPlanMode plans are always preserved.
+        "minimal"           — keep tool name + correlation id, replace input
+                              and output with a [STRIPPED] placeholder.
+        "full"              — pass through unchanged. Wider secrets surface;
+                              gitleaks + expanded patterns become the backstop.
+
+    This operates on the byte-level JSONL before `_redact` so we never run
+    regex over tool content we've decided to drop anyway.
+    """
+    if mode == "full":
+        return raw
+    if mode not in ("none", "minimal"):
+        mode = "none"  # safe default on typos
+
+    out_lines: list[str] = []
+    for line in raw.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        if not stripped.strip():
+            out_lines.append(line)
+            continue
+        try:
+            entry = json.loads(stripped)
+        except json.JSONDecodeError:
+            out_lines.append(line)  # pass through malformed
+            continue
+
+        message = entry.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, list):
+                message["content"] = _filter_content_blocks(content, mode)
+
+        # Preserve original line ending style
+        newline = "\n" if line.endswith("\n") else ""
+        out_lines.append(json.dumps(entry) + newline)
+
+    return "".join(out_lines)
+
+
+def _filter_content_blocks(blocks: list, mode: str) -> list:
+    """Apply the mode's filtering to a content-block array."""
+    filtered: list = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            filtered.append(block)
+            continue
+        btype = block.get("type")
+        if btype == "tool_use":
+            # ExitPlanMode plans are user-visible — keep them verbatim
+            # regardless of mode (matches the MD handling).
+            if block.get("name") == "ExitPlanMode":
+                filtered.append(block)
+            elif mode == "minimal":
+                filtered.append({
+                    "type": "tool_use",
+                    "id": block.get("id"),
+                    "name": block.get("name"),
+                    "input": "[STRIPPED]",
+                })
+            # mode == "none": drop entirely
+        elif btype == "tool_result":
+            if mode == "minimal":
+                filtered.append({
+                    "type": "tool_result",
+                    "tool_use_id": block.get("tool_use_id"),
+                    "content": "[STRIPPED]",
+                })
+            # mode == "none": drop entirely
+        else:
+            filtered.append(block)
+    return filtered
 
 
 def _last_assistant_text(transcript: Path) -> str:

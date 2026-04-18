@@ -39,6 +39,52 @@ With `auto_sync = true` (the default), the hook:
 
 Network failures never block the hook — they land in `~/.claude/palimpsest/errors.log`. Set `auto_sync = false` in `config.toml` to disable (useful when offline a lot, or when the machine is shared).
 
+## What gets logged — and secrets hygiene
+
+Two surfaces land on disk per turn (per brain):
+
+- **`.md`** — a condensed, human-readable narrative: your prompts, Claude's text responses, and ExitPlanMode plans. No tool content.
+- **`.jsonl`** — the richer transcript, governed by the `log_tool_calls` config setting.
+
+### `log_tool_calls` modes
+
+| Mode | What's in the `.jsonl` | When to pick it |
+|---|---|---|
+| `"none"` *(default)* | User prompts, Claude text blocks, ExitPlanMode plans. Tool calls and outputs are stripped entirely. | Almost always. The default. |
+| `"minimal"` | Same as `"none"`, plus each tool call's **name + correlation ID** (inputs/outputs are replaced with `[STRIPPED]`). | You want the compile loop to reason about *which* tools were used, without capturing *what* they read or returned. |
+| `"full"` | Everything verbatim — raw tool inputs, raw tool outputs, full file content pulled by `Read`, full stdout/stderr from `Bash`, everything. Write-time regex redaction still runs. | **Rarely. Read the warning below first.** |
+
+#### Why `"full"` is risky
+
+Most secrets that leak into AI-agent workflows leak via *tool output*. A `cat .env`, a `Read` on a config file, a database query dump, a `curl` with headers — any of these paste the raw content into the tool_result stream. In `"full"` mode, that content lands in your brain's `.jsonl` and gets git-pushed on the next Stop.
+
+Regex redaction catches common, well-known formats (Google / Anthropic / OpenAI keys, GitHub PATs, AWS access keys, JWTs, Azure connection strings, Stripe / Twilio / DigitalOcean / SendGrid / Slack webhooks, DB URLs with embedded credentials, private-key blocks). It will **not** catch hand-rolled tokens, environment-specific API keys named nothing like a known pattern, random binary blobs pasted as base64, or anything matching a format that hasn't been added yet.
+
+The audit radius of a leaked token in a `"full"`-mode brain:
+
+- Every device you clone that brain to.
+- Every teammate with read access.
+- GitHub's / your git host's backups (private-repo content is not training fodder on major hosts, but a compromise of the host or your account is a compromise).
+- Any future machine you haven't imagined yet.
+
+**For a solo setup on a private repo**, the risk is bounded but real — one leaked backup copies every shell output you've ever run. **For a shared brain (e.g. a team's work brain)**, every other contributor sees your tool output verbatim every day. There's no "this tool output is just for me" mode in `"full"`.
+
+Only pick `"full"` if:
+
+- You have a specific need (e.g. a compile loop that requires raw tool I/O to reason well).
+- The brain is private and you trust everyone with read access.
+- You've accepted that gitleaks is your only backstop against novel secret formats — and you've actually installed the pre-commit hook (see INSTALL Step 7).
+- You've extended `_REDACTION_PATTERNS` in your fork with secret formats specific to your stack.
+
+If you're not sure, leave it on `"none"`.
+
+### Secret redaction backstops
+
+Two layers:
+
+1. **Write-time regex** in the hook — best effort, catches well-known formats, runs before the file hits disk.
+2. **Pre-commit gitleaks** on each brain repo — maintained ruleset with ~150 secret patterns + entropy heuristics, blocks commits containing any hit. Strongly recommended; see INSTALL Step 7.
+
 ## Running on private repos, or a self-hosted git server
 
 Palimpsest is agnostic to the remote — the hooks call `git` directly, so whatever URL a brain's `origin` points at is what gets pulled from and pushed to.
@@ -77,11 +123,45 @@ In order, first match wins:
 
 ### Opt-out — `[nolog]`
 
-Use `/rename [nolog] <title>` on any session you want excluded from logging entirely (sensitive, personal, legal, etc.). The hook will:
+Use `/rename [nolog] <title>` on any session you want excluded from logging (sensitive, personal, legal, etc.). The hook will:
 
 - Write nothing new for that session.
-- **Purge** any prior entries for that session from every brain and the staging area — applying `[nolog]` mid-session retroactively erases what was captured earlier.
+- Delete any files for that session in every brain's working tree and in the unclassified staging area.
 - Suppress the classification nudge.
+
+#### ⚠️ `[nolog]` is not time-travel
+
+**What `[nolog]` does NOT do:**
+
+- It does **not** rewrite git history. If a previous Stop in this session already commit+pushed, the raw turns are in `origin/main` and on every teammate who has pulled. `[nolog]` can't recall that.
+- It does **not** touch Claude Code's own transcripts at `~/.claude/projects/<slug>/<session_id>.jsonl`. That's Claude Code's native state — Palimpsest routes a *copy* of each turn, it doesn't own Claude Code's storage. If that also needs wiping, delete it manually.
+
+**When `[nolog]` is actually enough:**
+
+- Early in a session, before the first Stop fires. Since `[nolog]` runs synchronously on the next hook and purges working-tree files before any new push, nothing leaks if you tag it fast.
+- On a local-only (no-remote) brain. No auto-push = nothing to recall.
+
+### Wiping already-committed content from a private brain
+
+If you realize too late that something sensitive was logged, you need real history rewriting — not `[nolog]`. Two paths:
+
+**(a) Ask Claude Code to do it.** Open a session in the brain repo and say, for example:
+
+> *"Wipe session `ed0acee3-…` from this brain. Look in `raw/logs/` for any file matching that session id, remove it, rewrite history with `git filter-repo`, force-push, and warn me to tell any collaborators to re-clone."*
+
+Claude picks the commands, confirms before force-push, and handles the cleanup.
+
+**(b) Do it by hand.**
+
+```bash
+cd <brain-path>
+git filter-repo --invert-paths --path-glob 'raw/logs/**/*<session_id>*'
+git push --force-with-lease origin main
+# Anyone else who cloned this brain: tell them to re-clone. Their old
+# local copy still has the deleted content.
+```
+
+Force-pushing a private repo is manageable; doing it on a shared brain requires coordinating with collaborators. Plan accordingly.
 
 ## File layout
 

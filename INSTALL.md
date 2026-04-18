@@ -8,9 +8,20 @@ Claude walks through the steps below, asking for paths and confirmations when ne
 
 ---
 
-## Step 0 — Locate the infra repo
+## Step 0 — Clone the infra, then pin to a tagged release
 
 The user has already cloned this repo. Note its absolute path (call it `$INFRA`). You'll need it when wiring up hooks.
+
+**Critical: pin to a tag, don't follow `main`.** The hook script executes on every user prompt + every response. Running directly off `main` means any future push to the infra repo runs on the user's machine. Instead:
+
+```bash
+cd "$INFRA"
+git fetch --tags
+# Pick the latest release (check https://github.com/sinjens/palimpsest-infra/releases)
+git checkout v0.3.0
+```
+
+When you later want to adopt a newer version, the user should review the release notes first, then re-run this checkout with the new tag. That explicit step is the only defence adopters have against a compromised or accidentally-bad commit in the public infra repo.
 
 ## Step 1 — Check prerequisites
 
@@ -31,11 +42,13 @@ If **git** is missing, install:
 - **macOS**: `brew install git` (or ships with Xcode Command Line Tools)
 - **Linux**: use host package manager
 
-Strongly recommended (for pre-commit secret scanning) — **gitleaks**:
+**Required** (pre-commit secret scanning — gitleaks is the brain repos' main backstop against novel secret formats the hook's regex doesn't catch): **gitleaks**:
 
 - **Windows**: `winget install gitleaks.gitleaks`
 - **macOS**: `brew install gitleaks`
 - **Linux**: use host package manager (or fetch a release binary from <https://github.com/gitleaks/gitleaks>)
+
+If you install Palimpsest without gitleaks, a single tool-output containing a hand-rolled token or an unlisted secret format can get committed and pushed before anyone notices. Don't skip Step 7.
 
 ## Step 1.5 — Know the opt-out
 
@@ -132,17 +145,24 @@ Then look under each brain's `raw/logs/<today>/` and `palimpsest-unclassified/<t
 
 Start a fresh Claude Code session and verify a real file lands where expected after one prompt + response.
 
-## Step 7 — Optional: pre-commit gitleaks on each brain repo
+## Step 7 — Required: pre-commit gitleaks on each brain repo
 
-For every brain repo `$BRAIN`, add a pre-commit hook that blocks commits containing secrets gitleaks recognises:
+For every brain repo `$BRAIN`, add a pre-commit hook that blocks commits containing any secret format gitleaks recognises. This is the backstop for anything the hook's regex doesn't catch — skipping it is how a stray hand-rolled token ends up in the remote.
 
 ```bash
 cat > "$BRAIN/.git/hooks/pre-commit" <<'EOF'
 #!/usr/bin/env bash
-gitleaks protect --staged --no-banner
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: gitleaks not on PATH — aborting commit." >&2
+  echo "Install with your platform's package manager (winget/brew/apt) and retry." >&2
+  exit 1
+fi
+exec gitleaks protect --staged --no-banner
 EOF
 chmod +x "$BRAIN/.git/hooks/pre-commit"
 ```
+
+Git hooks live in `.git/hooks/` and are **not** versioned — each device needs to install them separately. Run this during install on every machine.
 
 This is the belt to the suspenders. The logger's write-time redaction catches known patterns; gitleaks catches the long tail (and anything a pattern update adds after your logger was installed).
 

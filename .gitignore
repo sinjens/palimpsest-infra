@@ -1,3 +1,7 @@
+# User's live config (they should copy config.example.toml to ~/.claude/palimpsest/
+# — this guard is for cases where someone edits the example in place).
+config/config.toml
+
 # OS / editor detritus
 .DS_Store
 Thumbs.db

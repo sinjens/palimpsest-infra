@@ -17,6 +17,17 @@ default_scope = "unset"
 # if you're offline a lot or sharing a device with other users).
 auto_sync = true
 
+# How much tool-call content to include in the .jsonl sidecar.
+#   "none"    (default, safest) — strip all tool_use / tool_result blocks;
+#             ExitPlanMode plans are always kept (they're user-visible).
+#   "minimal"                   — keep tool name + correlation id but replace
+#             input/output with "[STRIPPED]". Useful if the compile loop
+#             wants "which tools ran" context without the content.
+#   "full"                      — keep everything verbatim. Expands the
+#             secrets surface significantly — see README for implications
+#             before enabling.
+log_tool_calls = "none"
+
 # Optional — where unset-scope sessions stage until you classify them.
 # Defaults to `~/source/palimpsest-unclassified` if omitted.
 # unclassified_path = "/absolute/path/to/palimpsest-unclassified"
