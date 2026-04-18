@@ -39,6 +39,34 @@ With `auto_sync = true` (the default), the hook:
 
 Network failures never block the hook — they land in `~/.claude/palimpsest/errors.log`. Set `auto_sync = false` in `config.toml` to disable (useful when offline a lot, or when the machine is shared).
 
+## Running on private repos, or a self-hosted git server
+
+Palimpsest is agnostic to the remote — the hooks call `git` directly, so whatever URL a brain's `origin` points at is what gets pulled from and pushed to.
+
+**Private GitHub repos.** The default. Any combination of `palimpsest-infra` / personal / work / both can be private on `github.com` with no script changes. Auth via `gh auth login` or a classic PAT with `repo` scope. [GitHub's policy](https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement) is that private-repo content isn't used for model training or made available to other users.
+
+**Self-hosted git server.** If you don't want anything on `github.com` at all — e.g. a company running [Gitea](https://about.gitea.com/), [Forgejo](https://forgejo.org/), GitLab CE, or Bitbucket Server — just point each brain's `origin` at the internal URL:
+
+```bash
+cd <brain-path>
+git remote set-url origin https://git.your-company.com/you/palimpsest-personal.git
+```
+
+Pulls and pushes work transparently. The hooks don't know or care which server they're talking to.
+
+**GitHub Enterprise Server (GHES).** Same pattern as self-hosted — set remotes to `https://github.your-company.com/...` and authenticate per your org's SSO/SAML-backed PAT.
+
+**Caveat for the future compile loop.** The nightly compile routine (see roadmap) runs inside Anthropic's infrastructure, so it needs network reach to whichever git server holds the brain repos. If that's an internal-only GHES or on-prem Gitea not exposed to the public internet, the managed agent can't clone. Two workarounds:
+
+1. **Run the compile script on your own always-on machine** (Unraid, NAS, office server, CI runner) instead of as a managed Anthropic routine. The code is identical; managed agents are just one deployment target.
+2. **Mirror to a reachable private GitHub repo** that the routine can clone from, and sync from your internal server on a schedule.
+
+**Picking an option.**
+
+- Solo developer, nothing legally sensitive beyond personal notes → private `github.com`. Easiest, zero infrastructure.
+- Small team, strong company-confidentiality policies → private `github.com` or GHES; managed routines still work directly.
+- Regulated industries (finance / defense / healthcare where even the *existence* of the repo is sensitive) → self-host, and run the compile loop on your own infrastructure, not Anthropic's.
+
 ## Scope resolution
 
 In order, first match wins:
