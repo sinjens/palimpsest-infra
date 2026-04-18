@@ -28,9 +28,17 @@ Each brain is its own git repo. You clone only the brains you need on a given de
 
 In order, first match wins:
 
-1. **Title prefix** — `/rename [work] <title>`, `/rename [private] <title>`, `/rename [both] <title>`. Prefix is stripped from the displayed title.
+1. **Title prefix** — `/rename [work] <title>`, `/rename [private] <title>`, `/rename [both] <title>`, or `/rename [nolog] <title>`. Prefix is stripped from the displayed title.
 2. **CWD rule** — substring match on the session's `cwd` (configured in `config.toml`).
 3. **Fallback** — unset → `palimpsest-unclassified/`. The hook nudges you once per session to classify. When you do, any already-logged entries auto-migrate into the chosen brain.
+
+### Opt-out — `[nolog]`
+
+Use `/rename [nolog] <title>` on any session you want excluded from logging entirely (sensitive, personal, legal, etc.). The hook will:
+
+- Write nothing new for that session.
+- **Purge** any prior entries for that session from every brain and the staging area — applying `[nolog]` mid-session retroactively erases what was captured earlier.
+- Suppress the classification nudge.
 
 ## File layout
 

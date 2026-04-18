@@ -37,6 +37,10 @@ Strongly recommended (for pre-commit secret scanning) — **gitleaks**:
 - **macOS**: `brew install gitleaks`
 - **Linux**: use host package manager (or fetch a release binary from <https://github.com/gitleaks/gitleaks>)
 
+## Step 1.5 — Know the opt-out
+
+Users can exclude any session from logging with `/rename [nolog] <title>`. The hook writes nothing new AND purges any prior entries for that session. Worth telling the user about this during install so they know it exists.
+
 ## Step 2 — Decide brain layout
 
 Ask the user where each brain should live. Typical defaults:

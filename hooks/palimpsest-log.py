@@ -8,7 +8,7 @@ date folder (HHMMSS_<title>_<session_id>.md + .jsonl), inside the brain(s)
 matching the session's resolved scope.
 
 Scope resolution (first match wins):
-    1. Title prefix   /rename [work]|[private]|[both] <rest>   — prefix stripped
+    1. Title prefix   /rename [work]|[private]|[both]|[nolog] <rest>  — stripped
     2. CWD rule match — substring match on `cwd` from the hook payload
     3. Fallback       — config.default_scope (typically "unset")
 
@@ -17,6 +17,8 @@ Routing:
     scope=work     →  brains.work     / raw / logs / YYYY-MM-DD / ...
     scope=both     →  brains.both     / raw / logs / YYYY-MM-DD / ...
     scope=unset    →  palimpsest-unclassified (unrouted staging)
+    scope=nolog    →  nothing is written; any prior entries for this
+                       session are purged from all brains and staging
 
 Config lives at ~/.claude/palimpsest/config.toml; missing/broken config
 degrades safely to the fallback path. The unclassified fallback defaults
@@ -77,6 +79,7 @@ _SCOPE_PREFIXES = {
     "[work]":    "work",
     "[private]": "private",
     "[both]":    "both",
+    "[nolog]":   "nolog",
 }
 
 
@@ -97,6 +100,13 @@ def main() -> int:
     config = _load_config()
     raw_title = _custom_title(Path(transcript_path)) if transcript_path else None
     scope, title = _resolve_scope(raw_title, cwd, config)
+
+    # [nolog] is an opt-out: purge any prior entries for this session and
+    # write nothing new. Never warn, never nudge — total silence.
+    if scope == "nolog":
+        _purge_session(session_id, config)
+        return 0
+
     target_roots = _target_log_roots(scope, config)
 
     # Pre-compute the shared content once so we don't re-read the transcript
@@ -274,6 +284,40 @@ def _unclassified_path(config: dict) -> Path:
     default to ~/source/palimpsest-unclassified."""
     override = config.get("unclassified_path")
     return Path(override) if override else _UNCLASSIFIED_DEFAULT
+
+
+def _purge_session(session_id: str, config: dict) -> None:
+    """Remove any previously-written files for this session from every brain
+    and the unclassified staging area, and clear the nudge marker. Called
+    when the session is marked [nolog] so no trace remains."""
+    roots: list[Path] = [_unclassified_path(config)]
+    for brain_path in (config.get("brains") or {}).values():
+        if brain_path:
+            roots.append(Path(brain_path) / "raw" / "logs")
+
+    for root in roots:
+        if not root.exists():
+            continue
+        for date_dir in list(root.iterdir()):
+            if not date_dir.is_dir():
+                continue
+            for f in list(date_dir.glob(f"*_{session_id}.*")):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+            try:
+                if not any(date_dir.iterdir()):
+                    date_dir.rmdir()
+            except OSError:
+                pass
+
+    try:
+        marker = _NUDGED_DIR / session_id
+        if marker.exists():
+            marker.unlink()
+    except OSError:
+        pass
 
 
 def _resolve_log_path(logs_root: Path, session_id: str, title: str | None) -> Path:
