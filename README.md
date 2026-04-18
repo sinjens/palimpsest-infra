@@ -24,6 +24,15 @@ session ──▶ UserPromptSubmit / Stop hook ──▶ scope resolver ──�
 
 Each brain is its own git repo. You clone only the brains you need on a given device; each brain's content is never duplicated across brains.
 
+## Auto-sync across devices
+
+With `auto_sync = true` (the default), the hook:
+
+- **Pulls each configured brain once per session** on the first `UserPromptSubmit`, using `git pull --rebase --autostash` with a 5-second timeout.
+- **Commits + async-pushes** to the target brain on every `Stop`. Commit is synchronous (so we know something was staged); push is a detached subprocess so Claude never waits for network.
+
+Network failures never block the hook — they land in `~/.claude/palimpsest/errors.log`. Set `auto_sync = false` in `config.toml` to disable (useful when offline a lot, or when the machine is shared).
+
 ## Scope resolution
 
 In order, first match wins:

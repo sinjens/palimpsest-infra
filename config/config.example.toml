@@ -11,6 +11,12 @@
 
 default_scope = "unset"
 
+# Auto-sync: on the first prompt of a session, pull --rebase --autostash
+# each configured brain; on every Stop, commit + async-push to the brain
+# the session routed to. Defaults to true. Set false to disable (useful
+# if you're offline a lot or sharing a device with other users).
+auto_sync = true
+
 # Optional — where unset-scope sessions stage until you classify them.
 # Defaults to `~/source/palimpsest-unclassified` if omitted.
 # unclassified_path = "/absolute/path/to/palimpsest-unclassified"

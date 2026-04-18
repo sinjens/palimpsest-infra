@@ -31,7 +31,9 @@ for the downstream compile loop). Both pass through the same write-time
 redaction pass as a belt-and-suspenders complement to gitleaks on push.
 """
 import json
+import os
 import re
+import subprocess
 import sys
 import tomllib
 from datetime import datetime
@@ -45,6 +47,13 @@ _UNCLASSIFIED_DEFAULT = Path.home() / "source" / "palimpsest-unclassified"
 CONFIG_PATH = Path.home() / ".claude" / "palimpsest" / "config.toml"
 # Per-session markers so we don't spam the classification nudge every turn.
 _NUDGED_DIR = Path.home() / ".claude" / "palimpsest" / ".nudged"
+# Per-session markers so we only pull each brain once per session.
+_PULLED_DIR = Path.home() / ".claude" / "palimpsest" / ".pulled"
+# Where auto-sync (and other) errors get appended.
+_ERRORS_LOG = Path.home() / ".claude" / "palimpsest" / "errors.log"
+# Hard timeout on network ops so a flaky connection never hangs the hook.
+_PULL_TIMEOUT_SECONDS = 5
+_COMMIT_TIMEOUT_SECONDS = 10
 
 # Characters Windows filenames can't contain
 _ILLEGAL_CHARS = '<>:"/\\|?*'
@@ -102,10 +111,16 @@ def main() -> int:
     scope, title = _resolve_scope(raw_title, cwd, config)
 
     # [nolog] is an opt-out: purge any prior entries for this session and
-    # write nothing new. Never warn, never nudge — total silence.
+    # write nothing new. Never warn, never nudge, never sync — total silence.
     if scope == "nolog":
         _purge_session(session_id, config)
         return 0
+
+    # On the first prompt of a session, pull each brain once so local state
+    # reflects any work pushed from another device. Skipped for unset (no
+    # target brain yet) and silently degrades on network failure.
+    if mode == "prompt" and _auto_sync_enabled(config) and scope != "unset":
+        _pull_brains(config, session_id)
 
     target_roots = _target_log_roots(scope, config)
 
@@ -163,6 +178,15 @@ def main() -> int:
             except OSError:
                 pass  # MD already written; JSONL mirror is nice-to-have
 
+    # After writing, fire an async commit+push back to the brain's remote.
+    # Skipped for unset scope (fallback folder isn't a git repo) and nolog
+    # (handled earlier). Failures never block Claude — they land in errors.log.
+    if mode == "stop" and _auto_sync_enabled(config) and scope != "unset":
+        commit_msg = f"log: {title or session_id} ({scope})"
+        for logs_root in target_roots:
+            brain_root = logs_root.parent.parent  # <brain>/raw/logs → <brain>
+            _commit_and_push_async(brain_root, commit_msg)
+
     return 0
 
 
@@ -181,6 +205,7 @@ def _load_config() -> dict:
         "rule": data.get("rule", []) or [],
         "brains": data.get("brains", {}) or {},
         "unclassified_path": data.get("unclassified_path"),
+        "auto_sync": data.get("auto_sync", True),
     }
 
 
@@ -284,6 +309,110 @@ def _unclassified_path(config: dict) -> Path:
     default to ~/source/palimpsest-unclassified."""
     override = config.get("unclassified_path")
     return Path(override) if override else _UNCLASSIFIED_DEFAULT
+
+
+def _auto_sync_enabled(config: dict) -> bool:
+    """Auto-sync defaults on. Disable with `auto_sync = false` in config."""
+    return bool(config.get("auto_sync", True))
+
+
+def _log_error(message: str) -> None:
+    """Append a timestamped error to palimpsest's errors.log. Silent on
+    failure — logging about logging-failures shouldn't itself fail loudly."""
+    try:
+        _ERRORS_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with _ERRORS_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}\n")
+    except OSError:
+        pass
+
+
+def _pull_brains(config: dict, session_id: str) -> None:
+    """Once per session, pull --rebase --autostash on each configured brain
+    repo so the local clone reflects any work pushed from another device.
+    Times out fast and fails open — network errors never block the hook."""
+    marker = _PULLED_DIR / session_id
+    try:
+        _PULLED_DIR.mkdir(parents=True, exist_ok=True)
+        if marker.exists():
+            return
+        # Mark first; a crash during pull shouldn't trigger retry storms.
+        marker.touch()
+    except OSError:
+        return
+
+    for brain_name, brain_path in (config.get("brains") or {}).items():
+        if not brain_path:
+            continue
+        p = Path(brain_path)
+        if not (p / ".git").exists():
+            continue  # not a git repo, skip quietly
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(p), "pull", "--rebase", "--autostash"],
+                capture_output=True, text=True, timeout=_PULL_TIMEOUT_SECONDS,
+            )
+            if result.returncode != 0:
+                _log_error(
+                    f"pull failed [{brain_name}]: "
+                    f"{(result.stderr or result.stdout or '').strip()[:500]}"
+                )
+        except subprocess.TimeoutExpired:
+            _log_error(f"pull timeout [{brain_name}] after {_PULL_TIMEOUT_SECONDS}s")
+        except OSError as e:
+            _log_error(f"pull error [{brain_name}]: {e}")
+
+
+def _commit_and_push_async(brain_path: Path, commit_msg: str) -> None:
+    """Stage + commit synchronously (fast), then fire a detached push.
+
+    Commit is synchronous because it's a local-only op (~100ms) and we
+    want to know right away whether anything was actually staged. Push is
+    detached so the hook can return while the network round-trip finishes
+    in the background — Claude never waits for git over the wire.
+    """
+    if not (brain_path / ".git").exists():
+        return
+    try:
+        subprocess.run(
+            ["git", "-C", str(brain_path), "add", "-A"],
+            check=True, capture_output=True, text=True,
+            timeout=_COMMIT_TIMEOUT_SECONDS,
+        )
+        diff = subprocess.run(
+            ["git", "-C", str(brain_path), "diff", "--cached", "--quiet"],
+            capture_output=True, timeout=_COMMIT_TIMEOUT_SECONDS,
+        )
+        if diff.returncode == 0:
+            return  # nothing staged, skip the push
+        subprocess.run(
+            ["git", "-C", str(brain_path), "commit", "-m", commit_msg],
+            check=True, capture_output=True, text=True,
+            timeout=_COMMIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.CalledProcessError as e:
+        _log_error(f"commit failed [{brain_path.name}]: {(e.stderr or '').strip()[:500]}")
+        return
+    except (subprocess.TimeoutExpired, OSError) as e:
+        _log_error(f"commit error [{brain_path.name}]: {e}")
+        return
+
+    # Detach push so the network delay doesn't block the hook.
+    popen_kwargs = {
+        "cwd": str(brain_path),
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if sys.platform == "win32":
+        popen_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(["git", "push"], **popen_kwargs)
+    except OSError as e:
+        _log_error(f"push spawn failed [{brain_path.name}]: {e}")
 
 
 def _purge_session(session_id: str, config: dict) -> None:
