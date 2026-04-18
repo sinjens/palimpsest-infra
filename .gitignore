@@ -1,0 +1,12 @@
+# OS / editor detritus
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Python cache (in case we ever add tooling locally)
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/

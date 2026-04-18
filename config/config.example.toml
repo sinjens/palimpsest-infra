@@ -1,0 +1,56 @@
+# Palimpsest logging config — template.
+#
+# Copy to ~/.claude/palimpsest/config.toml and edit the [brains] absolute
+# paths + adjust the [[rule]] CWD substrings to your own directory layout.
+#
+# How scope is decided, first match wins:
+#   1. Title prefix: /rename [work|private|both] <title>   — prefix stripped
+#   2. CWD rule: substring match on the session's cwd
+#   3. Fallback: default_scope (typically "unset") — routes to
+#      palimpsest-unclassified/ until the session is classified.
+
+default_scope = "unset"
+
+# Optional — where unset-scope sessions stage until you classify them.
+# Defaults to `~/source/palimpsest-unclassified` if omitted.
+# unclassified_path = "/absolute/path/to/palimpsest-unclassified"
+
+# ------- CWD rules (examples — adapt to your directory layout) -------
+
+# Personal / side-project roots
+[[rule]]
+match = "source/private"
+scope = "private"
+
+[[rule]]
+match = "source/personal"
+scope = "private"
+
+# Work repos
+[[rule]]
+match = "source/repos"
+scope = "work"
+
+[[rule]]
+match = "source/work"
+scope = "work"
+
+# Dual-scope (meta / infra / this repo)
+[[rule]]
+match = "source/palimpsest-infra"
+scope = "both"
+
+[[rule]]
+match = "source/Claude talks"
+scope = "both"
+
+# ------- Brain paths (absolute; per-device) -------
+#
+# Fill these in with the locations where you `git init`'d each brain
+# during install. Leave a brain out if you don't have it on this device
+# — sessions for that scope will fall back to palimpsest-unclassified.
+
+[brains]
+private = "REPLACE_ME_absolute_path_to_palimpsest-personal"
+work    = "REPLACE_ME_absolute_path_to_palimpsest-work"
+both    = "REPLACE_ME_absolute_path_to_palimpsest-both"
