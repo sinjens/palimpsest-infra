@@ -18,7 +18,7 @@ The user has already cloned this repo. Note its absolute path (call it `$INFRA`)
 cd "$INFRA"
 git fetch --tags
 # Pick the latest release (check https://github.com/sinjens/palimpsest-infra/releases)
-git checkout v0.3.0
+git checkout v0.3.1   # or the latest tag — see the repo's Releases page
 ```
 
 When you later want to adopt a newer version, the user should review the release notes first, then re-run this checkout with the new tag. That explicit step is the only defence adopters have against a compromised or accidentally-bad commit in the public infra repo.
