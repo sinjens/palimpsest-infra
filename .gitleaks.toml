@@ -1,13 +1,28 @@
 # Template gitleaks config for palimpsest brain repos.
 # Copy this to the root of each brain repo as `.gitleaks.toml`.
 #
-# Extends gitleaks' default ruleset and allowlists strings that match
-# the default rules purely by entropy / format but are not actually
-# secrets (SSH key fingerprints, most notably).
+# Extends gitleaks' default ruleset and allowlists false positives
+# that are common in log/audit content but not actually secrets.
 
 [extend]
 useDefault = true
 
-[[allowlists]]
-description = "SSH public-key fingerprints (SHA256:<43 base64 chars>) are public by design — they're the hash of the public half of a keypair, shared wherever a key needs to be identified."
-regexes = ['''SHA256:[A-Za-z0-9+/]{43}''']
+[allowlist]
+description = "Palimpsest-specific false-positive suppression"
+
+# The .jsonl files are machine-generated transcript mirrors that already
+# pass through palimpsest-log.py's write-time redaction layer. Re-scanning
+# them with gitleaks produces high noise (multi-megabyte blobs with lots
+# of high-entropy strings that aren't secrets — base64 thinking-block
+# signatures, content hashes, command-tool-use IDs). The `.md` files,
+# which are the human-readable narrative, are still scanned.
+paths = [
+    '''raw/logs/.*\.jsonl$''',
+]
+
+# SSH public-key fingerprints (SHA256:<43 base64 chars>) are public by
+# design — they're the hash of the public half of a keypair, shared
+# wherever a key needs to be identified.
+regexes = [
+    '''SHA256:[A-Za-z0-9+/]{43}''',
+]
