@@ -328,4 +328,166 @@ Keep brains **private** — they contain raw conversation data, even after redac
 
 - Every Claude Code session's prompts + responses land in the matching brain, date-sharded, redacted.
 - Unclassified sessions stage in `palimpsest-unclassified/` and auto-migrate on classification.
-- The `.jsonl` sidecar preserves full fidelity for a future compile loop (palimpsest curation layer — not part of v1).
+- The `.jsonl` sidecar preserves full fidelity for the compile loop.
+
+---
+
+## Step 9 — Compile loop (optional)
+
+The `compile-template/` directory in this infra repo ships the full LLM-synthesis + Opus-supervisor pipeline. Adopters who want curated articles in their brains (not just raw logs) run it per-brain, locally first and on a nightly Anthropic routine once it's tuned.
+
+### Per-brain setup
+
+For each of the user's own brains (personal, work, both):
+
+```bash
+# Inside the brain repo
+mkdir -p compile/prompts
+cp $INFRA/compile-template/main.py       compile/
+cp $INFRA/compile-template/supervise.py  compile/
+cp $INFRA/compile-template/.gitignore    compile/
+# Pick the right scope prompt variant:
+cp $INFRA/compile-template/prompts/synthesize.<scope>.md  compile/prompts/synthesize.md
+cp $INFRA/compile-template/prompts/supervise.<scope>.md   compile/prompts/supervise.md
+echo "2026-04-17" > compile/cursor.txt   # or yesterday's date; pick a recent starting point
+
+# Create the output tree
+mkdir -p palimpsest/patterns palimpsest/projects palimpsest/decisions
+cat > palimpsest/index.md <<'EOF'
+# Palimpsest — curated knowledge index
+
+*Machine-maintained — do not edit.*
+EOF
+```
+
+For the **work brain specifically**, also copy `promote.py`:
+
+```bash
+cp $INFRA/compile-template/promote.py  compile/promote.py
+```
+
+### How to run
+
+Each brain's compile is independent:
+
+```bash
+cd <brain>
+python compile/main.py          # Sonnet synthesis; creates/updates palimpsest/ articles
+python compile/supervise.py     # Opus review pass; merge/delete, confirm share: true flags
+```
+
+For the work brain, after main+supervise run the promotion:
+
+```bash
+cd $WORK_BRAIN
+PALIMPSEST_BOTH_BRAIN=$BOTH_BRAIN python compile/promote.py
+```
+
+`PALIMPSEST_BOTH_BRAIN` tells promote.py to also scan the both-scope brain for `share: true` articles. `PALIMPSEST_WORK_SHARED` points at the shared repo clone location (defaults to a sibling directory of the work brain).
+
+All three scripts commit locally. `main.py` and `supervise.py` do not push (let auto-sync handle it or push manually). `promote.py` does push, with rebase-retry if another contributor raced in.
+
+---
+
+## Step 10 — Team architecture & the shared company brain (optional)
+
+Palimpsest scales to a team via one shared repo, `palimpsest-work-shared`, that every contributor pushes their promoted content to. Its [README](https://github.com/sinjens/palimpsest-work-shared) covers the invariants.
+
+### The model
+
+- Each contributor owns their own private **personal / work / both** brains. Raw logs stay here, never shared.
+- There is **one** `palimpsest-work-shared` repo for the whole team — owned either by one employee (who invites colleagues as collaborators) or by a GitHub org with team access.
+- Each contributor runs their own nightly compile + promote. Their `promote.py` pushes `share: true`-flagged articles from their private work + both brains into `palimpsest-work-shared`.
+- Concurrent pushes from multiple contributors are safe: `promote.py` retries with `pull --rebase --autostash` on non-fast-forward rejection.
+
+### Onboarding a new team member
+
+1. They clone palimpsest-infra, check out the latest tag, and set up their own three private brain repos (Steps 0–8 above).
+2. Grant them access to `palimpsest-work-shared` (GitHub web UI → Settings → Collaborators, or add to the org team).
+3. They clone `palimpsest-work-shared` locally (default: sibling of their work brain, otherwise set `PALIMPSEST_WORK_SHARED`).
+4. They set up the compile loop (Step 9).
+5. They schedule their nightly routine (see below).
+
+Nothing in the per-contributor flow references anyone else's private brains. No raw log ever crosses contributor boundaries.
+
+### GDPR note
+
+Work-brain synthesis and supervisor prompts (`synthesize.work.md`, `supervise.work.md`) explicitly separate **systems from people**:
+
+- *Systems* — customer integrations, configs, data-model quirks, deployment specifics — are retained freely. This is the brain for how customers' systems actually work.
+- *People* — names, emails, phone numbers, personal preferences, attribution to individuals — are stripped or rewritten by role ("the customer's team decided X"). The supervisor's priority-1 check is personal-data scrubbing.
+
+Articles promoted to the shared brain inherit this scrubbing. Confirm before shipping widely if your team handles data subject to GDPR or equivalent.
+
+---
+
+## Step 11 — Anthropic nightly routine (optional)
+
+Once the compile loop runs cleanly locally for a few days, move it to an Anthropic managed agent so it runs every night without the user's machine needing to be on.
+
+### Repo access for the routine
+
+Two options for letting the routine clone/push the private brain repos:
+
+1. **GitHub App** (preferred) — install the managed-agents GitHub App on your account, grant it access to the specific repos (`palimpsest-work`, `palimpsest-both`, `palimpsest-work-shared`). The routine declares `github_repository` resources and Anthropic handles auth. No PAT rotation.
+2. **Fine-grained PAT** (fallback) — create a PAT with `Contents: Read and write` scoped to just the required repos. Store as a routine secret named `GITHUB_TOKEN`. The routine's prompt configures git to use it.
+
+### Template routine config
+
+Declare it in the Anthropic console. Rough shape:
+
+```yaml
+name: palimpsest-nightly
+schedule: "0 3 * * *"          # 03:00 daily in user's timezone
+resources:
+  - github_repository:
+      url: https://github.com/sinjens/palimpsest-infra
+      ref: v0.4.0              # pinned tag — never main
+      mount: /workspace/infra
+  - github_repository:
+      url: https://github.com/<user>/palimpsest-personal
+      ref: main
+      mount: /workspace/personal
+      permissions: write
+  - github_repository:
+      url: https://github.com/<user>/palimpsest-work
+      ref: main
+      mount: /workspace/work
+      permissions: write
+  - github_repository:
+      url: https://github.com/<user>/palimpsest-both
+      ref: main
+      mount: /workspace/both
+      permissions: write
+  - github_repository:
+      url: https://github.com/<team-owner>/palimpsest-work-shared
+      ref: main
+      mount: /workspace/shared
+      permissions: write
+```
+
+Routine prompt body:
+
+> Run the Palimpsest nightly compile. For each of these brains, `cd` into it and run `python compile/main.py` then `python compile/supervise.py`:
+>
+> - `/workspace/personal`
+> - `/workspace/work`
+> - `/workspace/both`
+>
+> Then run promotion from the work brain. From `/workspace/work`, run:
+>
+> ```bash
+> PALIMPSEST_BOTH_BRAIN=/workspace/both \
+>   PALIMPSEST_WORK_SHARED=/workspace/shared \
+>   python compile/promote.py
+> ```
+>
+> Each script commits + pushes on its own. If any script exits non-zero, include the last 50 lines of stderr in your completion output and continue with the remaining brains — don't abort the whole run on one failure.
+
+### Cost expectation
+
+One run per day uses 1 of your 15 Max daily routines. Token cost depends on raw log volume; typical estimate is $0.10–$0.50 per nightly run dominated by Sonnet input tokens. If you hit the Max 5-hour window cap on a given day, overflow bills at standard API rates.
+
+### Concurrency across a team
+
+Each contributor has their own routine (in their own Max plan or equivalent). They all push to the same `palimpsest-work-shared`. Collisions are handled by `promote.py`'s rebase-retry — no explicit time staggering needed. Brain repos that are per-contributor (personal/work/both) can't collide because they live under distinct GitHub accounts.
