@@ -113,6 +113,10 @@ Pulls and pushes work transparently. The hooks don't know or care which server t
 - Small team, strong company-confidentiality policies → private `github.com` or GHES; managed routines still work directly.
 - Regulated industries (finance / defense / healthcare where even the *existence* of the repo is sensitive) → self-host, and run the compile loop on your own infrastructure, not Anthropic's.
 
+### Plan note for private brain repos
+
+GitHub branch-protection rules — *require signed commits*, required PR review, CODEOWNERS enforcement — only apply to **private** repositories on the Pro or Team plans. On Free, these are public-repo-only. For solo use this rarely matters — the risk branch protection guards against (accidental direct push, unsigned pushes from a stolen PAT) is small next to the consequences of actually losing a PAT. But if your organisation already has a **GitHub Team** subscription, moving the shared work brain under the org unlocks the same governance at no added cost. Worth doing once the work brain has a second contributor.
+
 ### ⚠️ "Private" is relative
 
 A private GitHub repo means no public read access and — per GitHub's current policy — no training on its contents at rest. But using GitHub still means your data lives on Microsoft-owned Azure infrastructure, is accessible to GitHub employees under policy-bounded circumstances (abuse investigation, legal response, support), subject to US legal processes, and present in GitHub's backup systems for some period after you delete.
