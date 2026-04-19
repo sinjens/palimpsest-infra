@@ -149,6 +149,10 @@ Start a fresh Claude Code session and verify a real file lands where expected af
 
 For every brain repo `$BRAIN`, add a pre-commit hook that blocks commits containing any secret format gitleaks recognises. This is the backstop for anything the hook's regex doesn't catch — skipping it is how a stray hand-rolled token ends up in the remote.
 
+**Two pieces per brain:**
+
+**(a)** The pre-commit hook script (local to each device, not versioned):
+
 ```bash
 cat > "$BRAIN/.git/hooks/pre-commit" <<'EOF'
 #!/usr/bin/env bash
@@ -162,7 +166,19 @@ EOF
 chmod +x "$BRAIN/.git/hooks/pre-commit"
 ```
 
-Git hooks live in `.git/hooks/` and are **not** versioned — each device needs to install them separately. Run this during install on every machine.
+**(b)** A `.gitleaks.toml` at the brain's root (**versioned** — ships with the repo so teammates share the same allowlist). Copy it from this infra repo's template:
+
+```bash
+cp "$INFRA/config/gitleaks.toml" "$BRAIN/.gitleaks.toml"
+```
+
+The template:
+- Skips `raw/logs/*.jsonl` files (they're machine-generated transcript mirrors, already passed through the hook's write-time redaction; re-scanning them with gitleaks is high-noise / low-signal).
+- Allowlists SSH public-key fingerprints (`SHA256:<43 base64 chars>`) — they look high-entropy but are public by design.
+
+Customise per-brain if you end up with local false positives (hand-rolled token formats that gitleaks mistakes for something real).
+
+Git hooks in `.git/hooks/` are **not** versioned — each device needs to install (a) separately. The `.gitleaks.toml` from (b) **is** versioned and travels with the repo.
 
 This is the belt to the suspenders. The logger's write-time redaction catches known patterns; gitleaks catches the long tail (and anything a pattern update adds after your logger was installed).
 
