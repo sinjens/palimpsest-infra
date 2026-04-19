@@ -67,18 +67,37 @@ Ask the user where each brain should live. Typical defaults:
 
 A user may want the work brain under a work-specific repos directory, or separate roots for each. Ask.
 
-## Step 3 — Create brain folders as git repos
+**Also ask: does the user already have GitHub remotes for these brains from another device?** Brains are the sync boundary between devices, so most installs after the first will want to clone existing remotes rather than create fresh repos. Typical naming is `github.com/<user>/palimpsest-{personal,work,both}` (private). Collect the URLs up front — Step 3 branches on the answer.
 
-For each brain path `$BRAIN`:
+## Step 3 — Create or clone each brain repo
+
+The flow splits depending on whether the brain already exists as a GitHub remote:
+
+### Step 3a — First device ever (no remote yet)
+
+For each brain path `$BRAIN` that does not yet exist anywhere:
 
 ```bash
 mkdir -p "$BRAIN"
 cd "$BRAIN" && git init -b main
 ```
 
-Don't commit anything yet — that happens after Step 6 verification.
+Don't commit anything yet — that happens after Step 6 verification. Step 8 covers adding a remote once the user is ready.
 
-`palimpsest-unclassified` does not need to be a git repo (it's transient staging), but can be if desired.
+### Step 3b — Subsequent device (remote already exists)
+
+For each brain that already has a GitHub remote, clone it at the chosen path instead of `git init`:
+
+```bash
+git clone git@github.com:<you>/<brain-name>.git "$BRAIN"
+# or the https URL if the user prefers
+```
+
+This brings down the existing history from other devices. The clone already has `origin` configured, so Step 8 is a no-op for these brains.
+
+### Either path
+
+`palimpsest-unclassified` does not need to be a git repo (it's transient staging), but can be if desired. It is never pushed — no remote, on any device.
 
 ## Step 4 — Create `~/.claude/palimpsest/config.toml`
 
@@ -147,6 +166,8 @@ Start a fresh Claude Code session and verify a real file lands where expected af
 
 ## Step 7 — Required: pre-commit gitleaks on each brain repo
 
+**Runs on every device**, whether you created the brain in 3a or cloned it in 3b. Git hooks in `.git/hooks/` aren't versioned and therefore don't come down with `git clone` — each machine has to install them locally.
+
 For every brain repo `$BRAIN`, add a pre-commit hook that blocks commits containing any secret format gitleaks recognises. This is the backstop for anything the hook's regex doesn't catch — skipping it is how a stray hand-rolled token ends up in the remote.
 
 **Two pieces per brain:**
@@ -182,9 +203,11 @@ Git hooks in `.git/hooks/` are **not** versioned — each device needs to instal
 
 This is the belt to the suspenders. The logger's write-time redaction catches known patterns; gitleaks catches the long tail (and anything a pattern update adds after your logger was installed).
 
-## Step 8 — Add a remote (optional, when you're ready)
+## Step 8 — Add a remote (only if you created the brain in Step 3a)
 
-Each brain can have its own private GitHub repo. On each new device, `git clone` only the brains you want available there.
+Skip this step for any brain you cloned in 3b — `origin` is already set.
+
+For brains freshly `git init`'d in 3a, add a private GitHub remote once the user is ready to push. On subsequent devices they'll fall through Step 3b's `git clone` path instead.
 
 ```bash
 cd "$BRAIN"
