@@ -81,6 +81,10 @@ _ERRORS_LOG = Path.home() / ".claude" / "palimpsest" / "errors.log"
 # Hard timeout on network ops so a flaky connection never hangs the hook.
 _PULL_TIMEOUT_SECONDS = 5
 _COMMIT_TIMEOUT_SECONDS = 10
+# Detached push can afford more slack than the synchronous pull-on-prompt:
+# it runs out-of-band, so generosity here doesn't delay Claude's next turn.
+_PUSH_TIMEOUT_SECONDS = 15
+_REBASE_TIMEOUT_SECONDS = 15
 
 # Characters Windows filenames can't contain
 _ILLEGAL_CHARS = '<>:"/\\|?*'
@@ -135,6 +139,15 @@ def main() -> int:
     if len(sys.argv) < 2:
         return 0
     mode = sys.argv[1]
+
+    # `push-retry` is a self-dispatch from _commit_and_push_async. It runs in
+    # a detached child process, takes a brain path on argv, and consumes no
+    # stdin — handle it before the payload read below would block on empty
+    # stdin.
+    if mode == "push-retry":
+        if len(sys.argv) >= 3 and sys.argv[2]:
+            _push_with_rebase_retry(Path(sys.argv[2]))
+        return 0
 
     try:
         payload = json.load(sys.stdin)
@@ -438,9 +451,14 @@ def _commit_and_push_async(brain_path: Path, commit_msg: str) -> None:
         _log_error(f"commit error [{brain_path.name}]: {e}")
         return
 
-    # Detach push so the network delay doesn't block the hook.
+    # Detach push so the network delay doesn't block the hook. The child
+    # re-enters this script in `push-retry` mode, which handles the
+    # non-fast-forward case (another device or a parallel session raced us)
+    # by pulling --rebase --autostash once and retrying the push. Without
+    # this, resumed sessions silently pile up unpushable local commits
+    # because the pull-on-first-prompt marker prevents a re-pull.
     popen_kwargs = {
-        "cwd": str(brain_path),
+        "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
     }
@@ -451,9 +469,64 @@ def _commit_and_push_async(brain_path: Path, commit_msg: str) -> None:
     else:
         popen_kwargs["start_new_session"] = True
     try:
-        subprocess.Popen(["git", "push"], **popen_kwargs)
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "push-retry", str(brain_path)],
+            **popen_kwargs,
+        )
     except OSError as e:
         _log_error(f"push spawn failed [{brain_path.name}]: {e}")
+
+
+def _push_with_rebase_retry(brain_path: Path) -> None:
+    """Push `brain_path` to its remote; on non-fast-forward rejection,
+    pull --rebase --autostash and retry the push exactly once.
+
+    Runs out-of-band in a detached child (spawned by _commit_and_push_async)
+    so network round-trips never delay the hook's parent process. Fails
+    silently to errors.log — the next Stop will retry, and `git status`
+    remains the source of truth for the user.
+    """
+    if not (brain_path / ".git").exists():
+        return
+
+    def _run(args: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", "-C", str(brain_path), *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+
+    try:
+        first = _run(["push"], _PUSH_TIMEOUT_SECONDS)
+        if first.returncode == 0:
+            return
+
+        combined = (first.stderr or "") + (first.stdout or "")
+        diverged = any(
+            marker in combined
+            for marker in ("non-fast-forward", "rejected", "fetch first", "Updates were rejected")
+        )
+        if not diverged:
+            _log_error(f"push failed [{brain_path.name}]: {combined.strip()[:500]}")
+            return
+
+        rebase = _run(["pull", "--rebase", "--autostash"], _REBASE_TIMEOUT_SECONDS)
+        if rebase.returncode != 0:
+            _log_error(
+                f"push-retry rebase failed [{brain_path.name}]: "
+                f"{(rebase.stderr or rebase.stdout or '').strip()[:500]}"
+            )
+            return
+
+        retry = _run(["push"], _PUSH_TIMEOUT_SECONDS)
+        if retry.returncode != 0:
+            _log_error(
+                f"push-retry push failed [{brain_path.name}]: "
+                f"{(retry.stderr or retry.stdout or '').strip()[:500]}"
+            )
+    except subprocess.TimeoutExpired:
+        _log_error(f"push-retry timeout [{brain_path.name}]")
+    except OSError as e:
+        _log_error(f"push-retry error [{brain_path.name}]: {e}")
 
 
 def _purge_session(session_id: str, config: dict) -> None:
