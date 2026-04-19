@@ -23,6 +23,15 @@ git checkout v0.3.1   # or the latest tag — see the repo's Releases page
 
 When you later want to adopt a newer version, the user should review the release notes first, then re-run this checkout with the new tag. That explicit step is the only defence adopters have against a compromised or accidentally-bad commit in the public infra repo.
 
+## Step 0.5 — First machine, or adding to an existing ecosystem?
+
+Ask the user up front — several later steps branch on the answer:
+
+- **First machine**: no other device has palimpsest brains yet, no GitHub remotes for brains exist, git identity/signing may not be configured anywhere.
+- **Subsequent machine**: brains are already on GitHub from another device, and the user already has a git identity (and possibly signing) they want to replicate here.
+
+Where it matters: **Step 1.6** (identity + signing — subsequent machines should mirror the existing identity so the ecosystem's author metadata stays consistent), **Step 3** (subsequent machines clone remotes in 3b; first machines `git init` in 3a), **Step 8** (only applies after 3a).
+
 ## Step 1 — Check prerequisites
 
 ```bash
@@ -53,6 +62,102 @@ If you install Palimpsest without gitleaks, a single tool-output containing a ha
 ## Step 1.5 — Know the opt-out
 
 Users can exclude any session from logging with `/rename [nolog] <title>`. The hook writes nothing new AND purges any prior entries for that session. Worth telling the user about this during install so they know it exists.
+
+## Step 1.6 — Git identity and commit signing
+
+Brain auto-sync commits run unattended from the hook script. Bad identity here poisons every brain commit on every device; missing signing means you can never turn on "Require signed commits" branch protection on the brain repos without breaking auto-sync. Get this right before any commit fires.
+
+### Check the current state
+
+```bash
+git config --global user.name
+git config --global user.email
+git config --global commit.gpgsign
+```
+
+If `user.email` is unset or something like `your@email.com` / `user@example.com`, fix it here. If this is a subsequent machine (per Step 0.5), match what's already on the other device.
+
+### Ask the user
+
+- **Default name + email** for this machine's commits.
+- **Per-path overrides?** Common case: work repos under `~/source/work-org/` should use a work email while everything else uses personal. Use git's `includeIf` — see below.
+- **Sign commits?** Strongly recommended. Required if the user ever plans to turn on GitHub branch protection "Require signed commits" on the brain repos (auto-sync pushes will fail silently otherwise).
+- **Signing mechanism?** Default to SSH signing — simpler than GPG, reuses the same key type that's used for `git push`, no extra tooling on Windows.
+
+### Set default identity
+
+```bash
+git config --global user.name  "Firstname Lastname"
+git config --global user.email "you@example.com"
+```
+
+### Per-path email override (optional)
+
+Example: repos under `~/source/work-org/` use a different email. The `gitdir/i:` prefix is case-insensitive (matters on Windows); paths must use forward slashes and a trailing slash.
+
+```bash
+cat > ~/.gitconfig-work <<'EOF'
+[user]
+	email = you@work.example.com
+EOF
+
+git config --global \
+  "includeIf.gitdir/i:C:/Users/<you>/source/work-org/.path" \
+  "C:/Users/<you>/.gitconfig-work"
+```
+
+Verify: from inside a repo under that tree, `git config user.email` should return the work email; from outside, the default.
+
+### SSH signing
+
+Check for an existing key (`ls ~/.ssh/id_ed25519.pub` etc). If none, generate one:
+
+```bash
+ssh-keygen -t ed25519 -C "<email> (<machine-label>)" -f ~/.ssh/id_ed25519 -N ""
+```
+
+**Passphrase note**: empty passphrase makes auto-sync signing just work unattended. A non-empty passphrase needs an `ssh-agent` holding the unlocked key whenever the hook fires, or signed commits fail silently mid-session. Pick consciously — most palimpsest users want no passphrase and rely on OS file permissions for the key.
+
+Turn on signing:
+
+```bash
+git config --global gpg.format ssh
+git config --global user.signingkey "C:/Users/<you>/.ssh/id_ed25519.pub"
+git config --global commit.gpgsign true
+git config --global tag.gpgsign true
+```
+
+Optional — `allowed_signers` lets `git log --show-signature` verify signatures locally (GitHub's Verified badge is independent of this file):
+
+```bash
+mkdir -p ~/.config/git
+cat >> ~/.config/git/allowed_signers <<EOF
+<default-email> $(awk '{print $1,$2}' ~/.ssh/id_ed25519.pub)
+EOF
+# add one line per identity if using per-path overrides
+git config --global gpg.ssh.allowedSignersFile "C:/Users/<you>/.config/git/allowed_signers"
+```
+
+### Register the pubkey on GitHub — **pause here for the user**
+
+Show them the pubkey:
+
+```bash
+cat ~/.ssh/id_ed25519.pub
+```
+
+They install it at <https://github.com/settings/keys> as **two separate entries**:
+
+- **Authentication Key** — needed for SSH pushes; skip only if they push exclusively via HTTPS + credential helper.
+- **Signing Key** — needed for GitHub to display the Verified badge on signed commits.
+
+GitHub treats auth and signing keys independently. Registering only one leaves the other side broken.
+
+Wait for the user to confirm both entries are in place before moving on. Commits pushed before the key is registered as a Signing Key will show as Unverified forever on GitHub even though the signature itself is valid — GitHub only runs the check once, at push time.
+
+### Subsequent machines
+
+Never copy a private SSH key between machines. Each device generates its own keypair; the user registers each new device's pubkey on GitHub as its own auth + signing pair. Keep the git identity (`user.name`, `user.email`) identical across machines so the brain histories don't fragment by author.
 
 ## Step 2 — Decide brain layout
 
