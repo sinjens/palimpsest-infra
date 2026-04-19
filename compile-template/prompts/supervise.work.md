@@ -6,16 +6,17 @@ Raw logs are immutable; no human review gate. Default to skip when the library i
 
 ## What to look for
 
-1. **Contradictions** — reconcile by rewriting.
-2. **Redundancies** — merge into the canonical article, delete the subsumed one.
-3. **Thin content** — delete or merge. Work-scope bar is moderate; keep operational-specific articles even if short (they're reference material, not thin-pattern).
-4. **Stale content** — TTL expired AND the content contradicts newer articles or reality. Rewrite or delete. Customer project state often evolves; be willing to rewrite.
-5. **Missing backlinks** — cross-link between articles covering the same customer/project/pattern.
-6. **Project organization** — 3+ articles about one customer/product → move to `projects/<customer>/` or `products/<product>/` folder.
-7. **Promotion review**: Articles marked `share: true` in frontmatter go to the shared team brain. Review these:
-   - **Confirm** `share: true` on articles that are genuinely general (patterns, team-shared decisions, runbooks).
-   - **Strip** `share: true` on articles that contain customer-specific detail, personal working-hours references, or internal debugging narrative. These stay private to this brain.
-   - **Add** `share: true` if you notice a private article that would benefit the team.
+1. **People references (GDPR)** — highest priority. Any article that names individuals (colleagues, customer contacts, etc.), includes email addresses, phone numbers, or attributes decisions to a specific named person, gets rewritten to describe the role rather than the person. *"Kendra requested X"* → *"the customer's team requested X"*. Technical detail about systems stays; identifiable personal data goes. Customer *companies* may be named; customer *employees* may not.
+2. **Contradictions** — reconcile by rewriting.
+3. **Redundancies** — merge into the canonical article, delete the subsumed one.
+4. **Thin content** — delete or merge. Work-scope bar is moderate; keep operational-specific articles even if short (they're reference material, not thin-pattern).
+5. **Stale content** — TTL expired AND the content contradicts newer articles or reality. Rewrite or delete. Customer project state often evolves; be willing to rewrite.
+6. **Missing backlinks** — cross-link between articles covering the same customer/project/pattern.
+7. **Project organization** — 3+ articles about one customer/product → move to `projects/<customer>/` or `products/<product>/` folder.
+8. **Promotion review**: Articles marked `share: true` in frontmatter go to the shared team brain. Review these:
+   - **Confirm** `share: true` on articles that are genuinely general (patterns, team-shared decisions, runbooks) AND contain no lingering personal-data references.
+   - **Strip** `share: true` on articles that contain customer-specific operational detail or any residual people references. These stay private.
+   - **Add** `share: true` if you notice a private article that would benefit the team AND is free of personal data.
 
 ## Your input
 

@@ -6,11 +6,15 @@ Your job: read one session's raw conversation log plus the current palimpsest st
 
 ## Compilation standard for `work`
 
-This is the scope where **specifics are retained**. Customer names, product names, project names, internal URLs, named systems — all stay.
+This is the scope where **technical specifics are retained**. Customer names, product names, project names, internal URLs, named systems — all stay. The distinction that matters is **systems vs. people**.
 
-- **Capture**: technical decisions scoped to specific products / customers / projects, architectural notes, debugging stories worth keeping (when the bug was interesting or the fix is reusable), team-process decisions, tooling choices, integration specifics, deployment patterns, runbook-quality operational content.
+- **Capture** (freely, with specifics): customer-specific integration patterns, quirks in how their systems are wired, unusual configurations, authentication flows, data-model peculiarities, deployment specifics, SLA-shaped constraints, version-pinned library behaviour in their stack, workarounds for their environment. This is the brain for *how customers actually work* — that detail is what makes debugging and devops tractable later.
 - **Customer-specific articles are expected**. `projects/<customer>/` and `products/<product>/` folders grow freely.
-- **Strip**: personal asides that snuck into a work session (let the personal brain have those), secrets (the hook handles this at write-time), ephemeral task details without lasting insight.
+- **Strip** — **people, not systems** (GDPR):
+  - Names, email addresses, phone numbers, or handles of individuals at customers (or your own team).
+  - Individual preferences, personality traits, or references to specific contacts ("Kendra pushed for X", "the DevOps lead at Acme wouldn't approve Y").
+  - Rewrite attributions by role instead: *"the customer's team decided on X"*, *"their DevOps group preferred Y"*, *"the platform team's constraint"*. The customer's architecture is public; its people are not.
+- **Also strip**: personal asides from your own side that snuck into a work session (let the personal brain have those), secrets (the hook handles at write-time), ephemeral task details without lasting insight.
 
 ## Promotion candidates
 
