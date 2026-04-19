@@ -39,6 +39,33 @@ import tomllib
 from datetime import datetime
 from pathlib import Path
 
+
+def _augment_path_for_gitleaks() -> None:
+    """Prepend common gitleaks install locations to PATH so git pre-commit
+    hooks can find the binary even when this process inherited a stale PATH
+    (classic case: Claude Code was running before `winget install gitleaks`).
+    No-op if none of the candidate locations exist on this system.
+    """
+    path = os.environ.get("PATH", "")
+    sep = ";" if os.name == "nt" else ":"
+    candidates: list[str] = []
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if localappdata:
+        winget_pkgs = Path(localappdata) / "Microsoft" / "WinGet" / "Packages"
+        if winget_pkgs.exists():
+            for d in winget_pkgs.iterdir():
+                if d.is_dir() and "Gitleaks" in d.name and (d / "gitleaks.exe").exists():
+                    candidates.append(str(d))
+    for p in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"):
+        if os.path.isdir(p):
+            candidates.append(p)
+    added = [c for c in candidates if c not in path.split(sep)]
+    if added:
+        os.environ["PATH"] = sep.join(added + [path])
+
+
+_augment_path_for_gitleaks()
+
 # Staging folder for unset-scope sessions. Files live here until the user
 # classifies the session (via /rename [work]|[private]|[both]), at which
 # point they're migrated into the matching brain on the next hook firing.
