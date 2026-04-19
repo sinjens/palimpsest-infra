@@ -86,6 +86,16 @@ _COMMIT_TIMEOUT_SECONDS = 10
 _PUSH_TIMEOUT_SECONDS = 15
 _REBASE_TIMEOUT_SECONDS = 15
 
+
+def _no_window_kwargs() -> dict:
+    """subprocess kwargs that suppress console-window popups on Windows.
+    Git is a console app; without CREATE_NO_WINDOW, Windows creates a brief
+    console flash every time we spawn it from a background hook. No-op on
+    POSIX."""
+    if sys.platform == "win32":
+        return {"creationflags": subprocess.CREATE_NO_WINDOW}
+    return {}
+
 # Characters Windows filenames can't contain
 _ILLEGAL_CHARS = '<>:"/\\|?*'
 
@@ -405,6 +415,7 @@ def _pull_brains(config: dict, session_id: str) -> None:
             result = subprocess.run(
                 ["git", "-C", str(p), "pull", "--rebase", "--autostash"],
                 capture_output=True, text=True, timeout=_PULL_TIMEOUT_SECONDS,
+                **_no_window_kwargs(),
             )
             if result.returncode != 0:
                 _log_error(
@@ -432,10 +443,12 @@ def _commit_and_push_async(brain_path: Path, commit_msg: str) -> None:
             ["git", "-C", str(brain_path), "add", "-A"],
             check=True, capture_output=True, text=True,
             timeout=_COMMIT_TIMEOUT_SECONDS,
+            **_no_window_kwargs(),
         )
         diff = subprocess.run(
             ["git", "-C", str(brain_path), "diff", "--cached", "--quiet"],
             capture_output=True, timeout=_COMMIT_TIMEOUT_SECONDS,
+            **_no_window_kwargs(),
         )
         if diff.returncode == 0:
             return  # nothing staged, skip the push
@@ -443,6 +456,7 @@ def _commit_and_push_async(brain_path: Path, commit_msg: str) -> None:
             ["git", "-C", str(brain_path), "commit", "-m", commit_msg],
             check=True, capture_output=True, text=True,
             timeout=_COMMIT_TIMEOUT_SECONDS,
+            **_no_window_kwargs(),
         )
     except subprocess.CalledProcessError as e:
         _log_error(f"commit failed [{brain_path.name}]: {(e.stderr or '').strip()[:500]}")
@@ -463,9 +477,11 @@ def _commit_and_push_async(brain_path: Path, commit_msg: str) -> None:
         "stderr": subprocess.DEVNULL,
     }
     if sys.platform == "win32":
-        popen_kwargs["creationflags"] = (
-            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-        )
+        # CREATE_NO_WINDOW suppresses the console-window flash every time
+        # this fires. DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP leaves
+        # git (a console app) to create its own console on spawn; that's
+        # the "why is a git window popping up?" bug the user reported.
+        popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     else:
         popen_kwargs["start_new_session"] = True
     try:
@@ -493,6 +509,7 @@ def _push_with_rebase_retry(brain_path: Path) -> None:
         return subprocess.run(
             ["git", "-C", str(brain_path), *args],
             capture_output=True, text=True, timeout=timeout,
+            **_no_window_kwargs(),
         )
 
     try:
