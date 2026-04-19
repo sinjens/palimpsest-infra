@@ -1,0 +1,13 @@
+# Template gitleaks config for palimpsest brain repos.
+# Copy this to the root of each brain repo as `.gitleaks.toml`.
+#
+# Extends gitleaks' default ruleset and allowlists strings that match
+# the default rules purely by entropy / format but are not actually
+# secrets (SSH key fingerprints, most notably).
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "SSH public-key fingerprints (SHA256:<43 base64 chars>) are public by design — they're the hash of the public half of a keypair, shared wherever a key needs to be identified."
+regexes = ['''SHA256:[A-Za-z0-9+/]{43}''']
