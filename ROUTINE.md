@@ -94,51 +94,55 @@ The corresponding public key must be registered as a **signing** key (not just a
 
 ## Routine prompt
 
-Paste this as the prompt body. It uses `git rev-parse --show-toplevel` plus discovery to find wherever Routines put the clones — don't hardcode paths.
+Copy everything between the `*** PROMPT STARTS HERE ***` and `*** PROMPT ENDS HERE ***` markers into the routine's prompt body (exclusive of the markers themselves). Discovery is baked in — don't hardcode mount paths.
 
-> You are the Palimpsest nightly compile runner.
->
-> **Step 1 — discover brain checkouts.**
->
-> The cloud-container init cloned four repos somewhere on disk. Find them:
->
-> ```bash
-> for slug in palimpsest-personal palimpsest-work palimpsest-both palimpsest-work-shared; do
->   path=$(find / -maxdepth 6 -type d -name "$slug" 2>/dev/null | head -1)
->   echo "$slug=$path"
-> done
-> ```
->
-> Export the four discovered paths as `PERSONAL`, `WORK`, `BOTH`, `SHARED`. If any are empty, abort and report which are missing — do not fabricate.
->
-> **Step 2 — pull each brain.**
->
-> For each of `$PERSONAL`, `$WORK`, `$BOTH`, `$SHARED`: `cd` into it and `git pull --rebase --autostash`.
->
-> **Step 3 — synthesis + supervisor per brain.**
->
-> For each brain in that order (personal, work, both):
->
-> 1. `cd $<BRAIN>`
-> 2. `python compile/main.py`
-> 3. `python compile/supervise.py`
->
-> Each script commits + pushes on its own. If either exits non-zero, capture the last 50 lines of its stderr, continue to the next brain — don't abort the whole run.
->
-> **Step 4 — promote to shared.**
->
-> ```bash
-> cd $WORK
-> PALIMPSEST_BOTH_BRAIN="$BOTH" \
->   PALIMPSEST_WORK_SHARED="$SHARED" \
->   python compile/promote.py
-> ```
->
-> **Step 5 — report.**
->
-> Summarise per brain: rows compiled, articles created/updated/deleted, commit SHA pushed (or "no changes"). For any non-zero exit, include the stderr tail. One line per brain if everything succeeded.
->
-> **Do not**: retry failed scripts, edit brain content directly, or touch `palimpsest/index.md` or `palimpsest/CHANGELOG.md` (the scripts regenerate those).
+*** PROMPT STARTS HERE ***
+
+You are the Palimpsest nightly compile runner.
+
+**Step 1 — discover brain checkouts.**
+
+The cloud-container init cloned four repos somewhere on disk. Find them:
+
+```bash
+for slug in palimpsest-personal palimpsest-work palimpsest-both palimpsest-work-shared; do
+  path=$(find / -maxdepth 6 -type d -name "$slug" 2>/dev/null | head -1)
+  echo "$slug=$path"
+done
+```
+
+Export the four discovered paths as `PERSONAL`, `WORK`, `BOTH`, `SHARED`. If any are empty, abort and report which are missing — do not fabricate.
+
+**Step 2 — pull each brain.**
+
+For each of `$PERSONAL`, `$WORK`, `$BOTH`, `$SHARED`: `cd` into it and `git pull --rebase --autostash`.
+
+**Step 3 — synthesis + supervisor per brain.**
+
+For each brain in that order (personal, work, both):
+
+1. `cd $<BRAIN>`
+2. `python compile/main.py`
+3. `python compile/supervise.py`
+
+Each script commits + pushes on its own. If either exits non-zero, capture the last 50 lines of its stderr, continue to the next brain — don't abort the whole run.
+
+**Step 4 — promote to shared.**
+
+```bash
+cd $WORK
+PALIMPSEST_BOTH_BRAIN="$BOTH" \
+  PALIMPSEST_WORK_SHARED="$SHARED" \
+  python compile/promote.py
+```
+
+**Step 5 — report.**
+
+Summarise per brain: rows compiled, articles created/updated/deleted, commit SHA pushed (or "no changes"). For any non-zero exit, include the stderr tail. One line per brain if everything succeeded.
+
+**Do not**: retry failed scripts, edit brain content directly, or touch `palimpsest/index.md` or `palimpsest/CHANGELOG.md` (the scripts regenerate those).
+
+*** PROMPT ENDS HERE ***
 
 Keep the prompt in the console — tweaks shouldn't require a repo release + pin bump.
 
