@@ -2,135 +2,188 @@
 
 This document is for **operators** deploying the nightly compile loop to [Claude Code Routines](https://platform.claude.com) so it runs on Anthropic's infrastructure instead of a contributor's laptop. If you just want to use Palimpsest on your own machine, you don't need any of this — see `INSTALL.md`.
 
-## Status: research preview, expect gaps
+## Status: research preview
 
-Routines shipped as a research preview in April 2026. Some of what you need is **not yet publicly documented** and has to be confirmed in the Claude Code web console when you set it up. This document is organised around "here is what the routine must do" + "here is what you need to verify in the console because it isn't documented."
+Routines shipped as a research preview in April 2026. The authoring surface is UI-only and the runtime environment has a couple of non-obvious rough edges documented below.
 
-If you find the public schema / docs for any of the `VERIFY` items below, please PR back.
-
-## What this routine does
+## What the routine does
 
 For each brain repo the contributor owns, the routine runs three things:
 
-1. `python compile/main.py` — Sonnet synthesis pass: reads the day's raw logs, updates curated articles.
-2. `python compile/supervise.py` — Opus review pass: consolidates, reconciles contradictions, flags `share: true`.
+1. `python compile/main.py` — Sonnet synthesis: reads the day's raw logs, updates curated articles.
+2. `python compile/supervise.py` — Opus review: consolidates, reconciles contradictions, flags `share: true`.
 3. `python compile/promote.py` (from `palimpsest-work` only, with `PALIMPSEST_BOTH_BRAIN` set) — copies `share: true` articles from `palimpsest-work` and `palimpsest-both` into the shared company brain.
 
 Each script commits + pushes on its own. The cursor file (`compile/cursor.txt`) makes runs idempotent — re-running on the same day is a no-op.
 
-## The non-obvious dependency: these scripts shell out to `claude -p`
+## Container environment (verified as of 2026-04-20)
 
-`main.py` and `supervise.py` don't use the Anthropic API directly. They run `claude -p --model <sonnet|opus> --name "[nolog] ..."` as a subprocess and parse delimited blocks from stdout. This means the routine environment **must have the Claude Code CLI installed and authenticated**.
+The routine runtime ships with:
 
-This is the single most fragile part of running the loop as a routine. **VERIFY** in the console:
+- `claude` at `/opt/node22/bin/claude` (Claude Code CLI, authenticated as the routine's owner — subprocess calls to `claude -p` just work)
+- `python` at `/usr/local/bin/python`
+- `git` at `/usr/bin/git`
+- `curl`, `tar`, standard GNU utils
+- bun, cargo, rustup, npm, gradle (not needed by us)
 
-- Is `claude` CLI preinstalled in the routine's runtime image? If not, can the prompt install it (`npm i -g @anthropic-ai/claude-code` or the platform installer) as a first step?
-- Does the subprocess `claude -p` inherit the routine's own Claude credential, or does it need a separate auth step (e.g., `ANTHROPIC_API_KEY` env var, or a mounted `~/.claude/` directory)?
-- Does it bill against the same Max plan quota the routine itself runs under, or does it hit API billing?
+**Missing, must be added by setup script:**
 
-If the CLI path doesn't work in a routine, the fallback is to rewrite `invoke_claude()` to call the Anthropic Messages API directly. That's a ~20-line change but loses the subscription-bill path.
+- `gitleaks` — the brain repos' pre-commit hooks call it and fail closed if absent.
 
-## Prerequisites (at infrastructure level)
+## Container layout
 
-- All brain repos exist on GitHub and the contributor has push rights.
-- The shared repo `palimpsest-work-shared` exists and the contributor has push rights.
-- Brain repos have their pre-commit gitleaks hook installed and pass locally — routines that can't commit stall silently.
-- `compile/cursor.txt` exists in each brain (run the compile once locally first; creates it).
+Routines has **two separate initialization phases**:
 
-## Repo access
+1. **Cloud container setup** (UI): configure repos to clone. Routines handles the git clone into the container. You do NOT need to put clone URLs or a GitHub PAT in the routine prompt — the UI-configured repo list is cloned before anything else runs.
+2. **Setup script** (UI): a shell script that runs after the clones, before the Claude Code prompt starts. This is the place to install missing binaries, pin versions, and set env vars.
 
-Two options for giving the routine push access to private brain repos:
+**Repo mount path**: not `/workspace/...` — that was an earlier speculative guess that turned out wrong. The actual path is discovered at prompt start; see below.
 
-1. **GitHub App** (preferred if supported) — install the Claude Code Routines GitHub App on the contributor's account, grant it access only to the specific brain repos. No token rotation, per-repo scope.
-2. **Fine-grained PAT** (fallback) — create a PAT with `Contents: Read and write` scoped to just the required repos. Store as a routine secret (e.g., `GITHUB_TOKEN`). Have the routine prompt configure `git` to use it via `GIT_ASKPASS` or `.netrc`.
+## Setup script
 
-**VERIFY**: the current Routines product surface for GitHub access is not yet fully documented. Known fact: routines can only push to branches prefixed `claude/` by default as a safety guardrail — **this is incompatible with our scripts**, which push directly to `main`. Options:
+Paste this into the Routine's "setup script" field. It installs gitleaks pinned to a known version, verifies, and makes it available on PATH for all subsequent steps including the Claude Code session.
 
-- Disable or relax the `claude/` prefix guardrail for these repos (check console settings).
-- Change the scripts to push to `claude/nightly-YYYY-MM-DD` and have a second step (or the contributor) fast-forward `main`. This re-introduces a human-gate and is the opposite of what we want.
-- Use a PAT with direct push to `main` and skip the Routines-native GitHub integration entirely. Security tradeoff: the PAT has to be stored as a routine secret.
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-Confirm which of these applies before declaring the routine "deployed".
+# Install gitleaks — required by brain repos' pre-commit hook.
+# Pinned version; bump when you verify a newer release.
+GITLEAKS_VERSION="8.30.1"
 
-## Git identity and signing
+arch=$(uname -m)
+case "$arch" in
+  x86_64)  gl_arch="x64" ;;
+  aarch64) gl_arch="arm64" ;;
+  *) echo "unsupported arch: $arch" >&2; exit 1 ;;
+esac
 
-The routine makes real commits to real branches, so `user.name` and `user.email` must be set in the routine's git config. Options:
+url="https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_${gl_arch}.tar.gz"
+tmp=$(mktemp -d)
+curl -sSL "$url" | tar -xz -C "$tmp" gitleaks
+install -m 0755 "$tmp/gitleaks" /usr/local/bin/gitleaks
+rm -rf "$tmp"
 
-- **No signing**: set `user.name` and `user.email` via `git config --global` in the prompt body's prelude. Commits will be unsigned. The shared brain's branch protection must NOT require signed commits.
-- **SSH signing**: mount an Ed25519 signing key as a routine secret, write it to `~/.ssh/`, `git config gpg.format ssh`, `git config user.signingkey <path>`, `git config commit.gpgsign true`, and register the corresponding **public** key as a signing key on the GitHub account. Then pushes match the contributor's signed-commit policy.
+gitleaks version
 
-Routine commits will appear under whatever identity you configure — typically a dedicated `palimpsest-bot@<yourdomain>` mailbox, or the contributor's own email if you want the commits to attribute to them.
+# Git identity for commits the compile scripts will push.
+# Change to the contributor's preferred bot identity.
+git config --global user.name  "Palimpsest Bot"
+git config --global user.email "palimpsest-bot@example.com"
 
-## The routine prompt
+# Sanity: make sure all our deps are resolvable.
+for bin in claude python git gitleaks; do
+  command -v "$bin" >/dev/null || { echo "missing: $bin" >&2; exit 1; }
+done
 
-Rough shape. Adapt paths to whatever mount points the console gives you.
+echo "setup: ok"
+```
 
-> You are the Palimpsest nightly compile runner. Your job is to invoke three Python scripts across the contributor's brain repos and surface any failures in your completion output.
+If you want signed commits, also mount an SSH signing key as a routine secret and extend the setup script:
+
+```bash
+# optional: ssh signing
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+echo "$SSH_SIGNING_KEY" > ~/.ssh/palimpsest_sign && chmod 600 ~/.ssh/palimpsest_sign
+git config --global gpg.format ssh
+git config --global user.signingkey ~/.ssh/palimpsest_sign
+git config --global commit.gpgsign true
+```
+
+The corresponding public key must be registered as a **signing** key (not just auth) on the GitHub account whose name appears on the commits.
+
+## Routine prompt
+
+Paste this as the prompt body. It uses `git rev-parse --show-toplevel` plus discovery to find wherever Routines put the clones — don't hardcode paths.
+
+> You are the Palimpsest nightly compile runner.
 >
-> **Prelude — run once:**
+> **Step 1 — discover brain checkouts.**
 >
-> 1. Verify `claude`, `python`, `git`, `gitleaks` are all on PATH. If `claude` is missing, install with `npm i -g @anthropic-ai/claude-code` (or whatever the routine-env install path is).
-> 2. Configure git: `git config --global user.name "Palimpsest Bot"` and `git config --global user.email "<configured-email>"`. If an SSH signing key is mounted, configure signing too.
-> 3. `git pull --rebase --autostash` each mounted brain repo in turn.
+> The cloud-container init cloned four repos somewhere on disk. Find them:
 >
-> **Main loop — for each brain in `[personal, work, both]`:**
->
-> 1. `cd /workspace/<brain>`
-> 2. `python compile/main.py` — synthesis pass. If exit ≠ 0, capture the last 50 lines of stderr, continue to next brain.
-> 3. `python compile/supervise.py` — supervisor pass. Same failure handling.
->
-> **Promotion — once at the end:**
->
+> ```bash
+> for slug in palimpsest-personal palimpsest-work palimpsest-both palimpsest-work-shared; do
+>   path=$(find / -maxdepth 6 -type d -name "$slug" 2>/dev/null | head -1)
+>   echo "$slug=$path"
+> done
 > ```
-> cd /workspace/work
-> PALIMPSEST_BOTH_BRAIN=/workspace/both \
->   PALIMPSEST_WORK_SHARED=/workspace/shared \
+>
+> Export the four discovered paths as `PERSONAL`, `WORK`, `BOTH`, `SHARED`. If any are empty, abort and report which are missing — do not fabricate.
+>
+> **Step 2 — pull each brain.**
+>
+> For each of `$PERSONAL`, `$WORK`, `$BOTH`, `$SHARED`: `cd` into it and `git pull --rebase --autostash`.
+>
+> **Step 3 — synthesis + supervisor per brain.**
+>
+> For each brain in that order (personal, work, both):
+>
+> 1. `cd $<BRAIN>`
+> 2. `python compile/main.py`
+> 3. `python compile/supervise.py`
+>
+> Each script commits + pushes on its own. If either exits non-zero, capture the last 50 lines of its stderr, continue to the next brain — don't abort the whole run.
+>
+> **Step 4 — promote to shared.**
+>
+> ```bash
+> cd $WORK
+> PALIMPSEST_BOTH_BRAIN="$BOTH" \
+>   PALIMPSEST_WORK_SHARED="$SHARED" \
 >   python compile/promote.py
 > ```
 >
-> **Completion output:**
+> **Step 5 — report.**
 >
-> Report, per brain: rows compiled, articles created/updated/deleted, commit SHAs pushed. For any non-zero exit, include the captured stderr tail. If everything succeeded, one-line summary per brain is enough — do not dump full script output.
+> Summarise per brain: rows compiled, articles created/updated/deleted, commit SHA pushed (or "no changes"). For any non-zero exit, include the stderr tail. One line per brain if everything succeeded.
 >
-> **Do not**: retry failed scripts, edit brain content directly, or touch `palimpsest/index.md` / `palimpsest/CHANGELOG.md` (the scripts regenerate these).
+> **Do not**: retry failed scripts, edit brain content directly, or touch `palimpsest/index.md` or `palimpsest/CHANGELOG.md` (the scripts regenerate those).
 
-Keep this in the console, not in the repo, so tweaks don't require a repo release + pin bump.
+Keep the prompt in the console — tweaks shouldn't require a repo release + pin bump.
+
+## The `claude/` branch-prefix guardrail
+
+Routines defaults to only allowing pushes to branches prefixed `claude/` as a safety measure. Our compile scripts push directly to `main`. Options:
+
+- **Disable the guardrail** for these specific repos in the routine settings. This is the intended path for our use case since the compile scripts are already the trusted code path — the guardrail is designed for cases where Claude is writing arbitrary code.
+- **Reroute to `claude/` branches** by changing the push logic in `main.py`, `supervise.py`, and `promote.py` to push to a nightly branch and opening a PR. This reintroduces a human-gate, which is the opposite of the design.
+
+Confirm the guardrail setting before declaring the routine deployed. Runs will appear to succeed but actually fail to push if the guardrail is still on.
 
 ## Scheduling
 
-- **Frequency**: once daily. The cursor is idempotent, so running more often than necessary is waste, not breakage.
-- **Time**: 03:00 in the contributor's timezone is a decent default — picks up the previous day's logs after everyone's gone home.
-- **Drift**: if you skip days (routine paused, machine offline), the next run catches up from the cursor forward. No backfill logic needed.
+- **Frequency**: once daily. Cursor is idempotent, so extra runs are waste, not breakage.
+- **Time**: 03:00 local is a decent default — picks up the previous day's logs after contributors are offline.
+- **Drift**: skipped days (routine paused, outage) catch up on the next run from the cursor forward. No backfill logic needed.
 
 ## Cost and quota
 
-- Per-run runtime: typically 2–10 minutes depending on how many new raw-log days there are to process.
-- Token cost: dominated by Sonnet input tokens on the synthesis pass. Rough estimate $0.10–$0.50 per nightly run.
-- Runtime cost: Anthropic's routine runtime fee (as of writing, $0.08/hr, so ≈ $0.01 per run).
-- Quota: routines count against your plan's daily routine limit (Pro: 5, Max: 15, Team/Enterprise: 25), separate from your interactive-session quota.
+- Per-run runtime: 2–10 minutes depending on how many new raw-log days there are.
+- Token cost: dominated by Sonnet input tokens in synthesis. Rough estimate $0.10–$0.50 per nightly run.
+- Runtime cost: Anthropic's hourly container fee (≈ $0.01 per run at current rates).
+- Quota: counts against daily routine limit (Pro 5, Max 15, Team/Enterprise 25), separate from interactive-session quota.
 
 ## Concurrency across a team
 
-Each contributor runs their own routine from their own plan. They all push to the same `palimpsest-work-shared`. Collisions are handled by `promote.py`'s `pull --rebase --autostash` + single-retry on non-fast-forward rejection. Per-contributor brain repos (`-personal` / `-work` / `-both`) can't collide because each lives under a distinct GitHub account.
+Each contributor runs their own routine from their own plan. They all push to the same `palimpsest-work-shared`. Collisions are handled by `promote.py`'s `pull --rebase --autostash` + single-retry on non-fast-forward. Per-contributor brain repos can't collide because each lives under a distinct GitHub account.
 
-No time staggering is needed, but spreading across a 2-hour window is harmless if you'd rather avoid a thundering herd on the shared repo.
+No time staggering required. Spreading across a 2-hour window is harmless if you'd rather avoid a thundering herd on the shared repo.
 
-## Failure handling and observability
+## Failure handling
 
-**VERIFY** in the console:
-
-- What does the routine send on failure — email, Slack, nothing?
-- How long are execution logs retained?
-- Is there an API to query recent runs, or UI only?
-
-If failure notification is too coarse, the fallback is to have the routine's completion message include a summary and rely on the daily cadence being noticed when it stops arriving. The compile scripts' own push mechanism means you can also see "no commits from bot today" as a signal.
+**VERIFY in the console**: what Routines sends on run failure (email, Slack, nothing), and how long execution logs are retained. As a fallback, the compile scripts' own push mechanism means "no new commits from the bot today" is a visible signal that a run failed silently.
 
 ## Why not just cron it locally?
 
-Local cron works and avoids every unknown above. The reason to move to a routine is:
+Local cron works and avoids every routine-specific wrinkle above. Reasons to move to a routine:
 
 - Contributor's laptop is off or asleep at 03:00 — local cron doesn't fire.
 - Multi-device contributors don't want N redundant cron jobs racing each other.
 - Shared-brain promotion wants a reliable cadence even when no one is logged in.
 
-If those don't apply, a local Scheduled Task (Windows) or launchd/cron job (macOS/Linux) pointed at the same three scripts is strictly simpler.
+If none of those apply, a local Scheduled Task (Windows) or launchd/cron job (macOS/Linux) pointed at the same three scripts is strictly simpler.
+
+## Changelog
+
+- **2026-04-20**: First real routine run. Confirmed `claude`/`python`/`git` preinstalled, `gitleaks` missing. Confirmed two-phase init (cloud-container clone then setup script). Replaced speculative `/workspace/` mount paths with prompt-time discovery. Pinned gitleaks 8.30.1 in setup script.
