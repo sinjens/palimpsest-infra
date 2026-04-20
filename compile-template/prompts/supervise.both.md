@@ -6,12 +6,15 @@ The human gatekeeper is intentionally out of the loop. Your edits land directly.
 
 ## What to look for
 
-1. **Contradictions** — two articles claiming opposite facts about the same thing. Reconcile: rewrite whichever is wrong (or both, if nuance was lost). Cite specifics in the reason.
-2. **Redundancies** — two articles covering substantially the same ground. Merge: rewrite one as the canonical, delete the other, ensure inbound links are updated (by rewriting the linker).
-3. **Thin content** — an article that's three bullets and a vague context section. Delete, or merge into a fuller sibling. Don't keep low-signal entries in `both` — the bar here is the highest.
-4. **Stale content** — articles whose `updated` frontmatter + TTL has elapsed, AND whose content is demonstrably out of date given newer articles or synthesis. Rewrite with the new information; bump `updated` to today.
-5. **Missing backlinks** — article A mentions the topic article B covers but doesn't `[[link]]` to it. Rewrite A to add the link.
-6. **Promotion candidates for the shared work brain** — articles generalizable enough to be shareable with colleagues. Add `share: true` to the frontmatter.
+1. **Promotion flags first** — `both`-scope content defaults toward shareable. Review every article:
+   - **Confirm** `share: true` on articles that are genuinely broadly applicable (patterns, architectural decisions, tool choices, debugging techniques that would help other engineers).
+   - **Add** `share: true` if a private-flagged article is actually general-purpose technical content. Most `both` articles should carry this flag.
+   - **Strip** `share: true` only when content is truly about the author's personal workflow, idiosyncratic tooling, or meta-observations that wouldn't transfer. Err toward sharing.
+2. **Contradictions** — two articles claiming opposite facts about the same thing. Reconcile: rewrite whichever is wrong (or both, if nuance was lost). Cite specifics in the reason.
+3. **Redundancies** — two articles covering substantially the same ground. Merge: rewrite one as the canonical, delete the other, ensure inbound links are updated (by rewriting the linker).
+4. **Thin content** — an article that's three bullets and a vague context section. Delete, or merge into a fuller sibling. Don't keep low-signal entries in `both` — the bar here is the highest.
+5. **Stale content** — articles whose `updated` frontmatter + TTL has elapsed, AND whose content is demonstrably out of date given newer articles or synthesis. Rewrite with the new information; bump `updated` to today.
+6. **Missing backlinks** — article A mentions the topic article B covers but doesn't `[[link]]` to it. Rewrite A to add the link.
 7. **Organization** — if 3+ articles cluster around a single project or product, consider moving them into a `projects/<slug>/` folder. Use the `move` action (emit a create at the new path + a delete at the old path, and rewrite any linker).
 
 ## Your input

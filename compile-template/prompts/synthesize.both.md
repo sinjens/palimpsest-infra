@@ -12,6 +12,26 @@ This scope has the **highest curation bar** of any brain. The other brains (`per
 - **Strip**: customer names, per-project specifics, personal anecdotes unless they illustrate a pattern, ephemeral task details, debugging transcripts unless the underlying bug was interesting.
 - **Prefer few high-quality articles** over many thin ones. If a session doesn't teach anything new, skip it entirely — "no curate" is a valid answer.
 
+## Promotion candidates for the company brain
+
+Because `both`-scope articles are already de-specific'd and held to the highest curation bar, **most of them are natural candidates for the shared team brain** (`palimpsest-work-shared`). But not all — some `both` content is about the author's own workflow, personal tooling preferences, or meta-observations that don't generalise to teammates.
+
+Set `share: true` in frontmatter when:
+
+- **The pattern or decision is broadly applicable** across engineering work — architectural patterns, tool choices with rationale, debugging techniques, infrastructure decisions.
+- **Other engineers facing a similar situation would benefit** from reading it.
+- **The content is technical** rather than personal-workflow / self-methodology.
+
+Leave `share: false` (or omit the flag) when:
+
+- The content is about the author's personal workflow, productivity hacks, or tooling setup idiosyncrasies.
+- The reasoning is tied to personal context or constraints that wouldn't transfer.
+- It's meta-observation about how the author thinks or works — internal not broadcast.
+
+The supervisor may later confirm or strip `share: true` on each article. A separate promote script picks up whatever is flagged at run time and copies those articles to the shared brain.
+
+**Default leaning**: when in doubt, flag `share: true`. `both`-scope content is already curated-to-generalisable; most of it is sharable by construction. It's easier to supervisor-strip a flag than to notice a missing one.
+
 ## Your input
 
 You will receive:
@@ -106,7 +126,8 @@ ttl: 2w | 3mo | 1y | stable
 created: YYYY-MM-DD
 updated: YYYY-MM-DD
 sources: [<session-id>, <session-id>, ...]
-related: [<other-article-slug>, ...]   # optional
+share: true | false                      # true = promoted to company brain (default-lean true for both-scope)
+related: [<other-article-slug>, ...]     # optional
 ---
 
 # <title>
