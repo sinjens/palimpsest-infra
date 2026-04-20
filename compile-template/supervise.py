@@ -18,6 +18,42 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
+# Force UTF-8 on stdout/stderr so Sonnet responses containing non-ASCII
+# (arrows, em-dashes, accented characters, etc.) don't crash `print()` on
+# Windows terminals that default to cp1252.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, OSError):
+    pass
+
+
+def _augment_path_for_gitleaks() -> None:
+    """Prepend common gitleaks install locations to PATH so the brain's
+    pre-commit hook can find the binary. Classic case: Claude Code was
+    running when `winget install gitleaks` ran, so its cached PATH never
+    picked up the new binary. This script inherits that stale PATH unless
+    we fix it here."""
+    path = os.environ.get("PATH", "")
+    sep = ";" if os.name == "nt" else ":"
+    candidates: list[str] = []
+    localappdata = os.environ.get("LOCALAPPDATA")
+    if localappdata:
+        winget_pkgs = Path(localappdata) / "Microsoft" / "WinGet" / "Packages"
+        if winget_pkgs.exists():
+            for d in winget_pkgs.iterdir():
+                if d.is_dir() and "Gitleaks" in d.name and (d / "gitleaks.exe").exists():
+                    candidates.append(str(d))
+    for p in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"):
+        if os.path.isdir(p):
+            candidates.append(p)
+    added = [c for c in candidates if c not in path.split(sep)]
+    if added:
+        os.environ["PATH"] = sep.join(added + [path])
+
+
+_augment_path_for_gitleaks()
+
 # Reuse the shared machinery from main.py
 _THIS = Path(__file__).resolve()
 sys.path.insert(0, str(_THIS.parent))
