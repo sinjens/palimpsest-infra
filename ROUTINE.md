@@ -113,9 +113,17 @@ done
 
 Export the four discovered paths as `PERSONAL`, `WORK`, `BOTH`, `SHARED`. If any are empty, abort and report which are missing — do not fabricate.
 
-**Step 2 — pull each brain.**
+**Step 2 — pull each brain, pin to main.**
 
-For each of `$PERSONAL`, `$WORK`, `$BOTH`, `$SHARED`: `cd` into it and `git pull --rebase --autostash`.
+For each of `$PERSONAL`, `$WORK`, `$BOTH`, `$SHARED`:
+
+```bash
+cd $<BRAIN>
+git checkout main
+git pull --rebase --autostash origin main
+```
+
+All commits and pushes throughout this run must land on `main`. Do not create `claude/*` branches. If you see any step attempt to open a PR or push to a non-main branch, stop and report it.
 
 **Step 3 — synthesis + supervisor per brain.**
 
@@ -146,14 +154,17 @@ Summarise per brain: rows compiled, articles created/updated/deleted, commit SHA
 
 Keep the prompt in the console — tweaks shouldn't require a repo release + pin bump.
 
-## The `claude/` branch-prefix guardrail
+## The `claude/` branch-prefix guardrail — disable it
 
-Routines defaults to only allowing pushes to branches prefixed `claude/` as a safety measure. Our compile scripts push directly to `main`. Options:
+Routines defaults to rewriting pushes from `main` onto a per-run `claude/<adjective>-<scientist>-<suffix>` branch as a safety measure. That's good hygiene for cases where Claude is writing arbitrary code, but it's wrong for our use case: the compile scripts are already the trusted code path, and we want their pushes to land on `main` so downstream consumers (the contributor's laptop, other routines, collaborators' checkouts) see curated content without a manual merge step.
 
-- **Disable the guardrail** for these specific repos in the routine settings. This is the intended path for our use case since the compile scripts are already the trusted code path — the guardrail is designed for cases where Claude is writing arbitrary code.
-- **Reroute to `claude/` branches** by changing the push logic in `main.py`, `supervise.py`, and `promote.py` to push to a nightly branch and opening a PR. This reintroduces a human-gate, which is the opposite of the design.
+**Before deploying the routine, disable the guardrail** for the four brain repos in the Routine settings. Also set the routine's default target branch to `main`. If the guardrail is left on, runs will appear to succeed — the scripts' `git push` exits 0 — but the commits silently land on `claude/*` branches instead of `main` and pile up as unmerged noise.
 
-Confirm the guardrail setting before declaring the routine deployed. Runs will appear to succeed but actually fail to push if the guardrail is still on.
+If you run a routine before disabling and end up with commits on `claude/*` branches, you have three options per branch:
+
+- **Fast-forward merge into main** if main hasn't moved: `git checkout main && git merge --ff-only origin/claude/<branch> && git push && git push origin --delete claude/<branch>`.
+- **Cherry-pick the commits** onto current main if main has diverged. Preserves routine-bot authorship.
+- **Delete the branch** if the commits were no-ops (supervisor: library coherent): `git push origin --delete claude/<branch>`.
 
 ## Scheduling
 
@@ -191,3 +202,4 @@ If none of those apply, a local Scheduled Task (Windows) or launchd/cron job (ma
 ## Changelog
 
 - **2026-04-20**: First real routine run. Confirmed `claude`/`python`/`git` preinstalled, `gitleaks` missing. Confirmed two-phase init (cloud-container clone then setup script). Replaced speculative `/workspace/` mount paths with prompt-time discovery. Pinned gitleaks 8.30.1 in setup script.
+- **2026-04-20**: Second real routine run. All four pushes landed on `claude/*` branches, not `main`, because the default-on branch-prefix guardrail rewrote them. Supervisor edits on personal + both were genuinely useful and merged back manually. Added explicit main-only instruction to prompt and reframed the guardrail section as "disable before first run, with recovery recipe if you forgot".
