@@ -421,73 +421,12 @@ Articles promoted to the shared brain inherit this scrubbing. Confirm before shi
 
 ---
 
-## Step 11 — Anthropic nightly routine (optional)
+## Step 11 — Run the nightly compile on Anthropic's infrastructure (optional)
 
-Once the compile loop runs cleanly locally for a few days, move it to an Anthropic managed agent so it runs every night without the user's machine needing to be on.
+Once the compile loop runs cleanly locally for a few days, you can move it to a [Claude Code Routine](https://platform.claude.com) so it runs every night without any contributor's machine needing to be on.
 
-### Repo access for the routine
+That's a separate operational concern from per-machine install, and has enough unknowns (Routines is a research-preview product, several config details are UI-only and not yet publicly documented) that it lives in its own file rather than cluttering this one:
 
-Two options for letting the routine clone/push the private brain repos:
+→ See [`ROUTINE.md`](./ROUTINE.md) in this repo.
 
-1. **GitHub App** (preferred) — install the managed-agents GitHub App on your account, grant it access to the specific repos (`palimpsest-work`, `palimpsest-both`, `palimpsest-work-shared`). The routine declares `github_repository` resources and Anthropic handles auth. No PAT rotation.
-2. **Fine-grained PAT** (fallback) — create a PAT with `Contents: Read and write` scoped to just the required repos. Store as a routine secret named `GITHUB_TOKEN`. The routine's prompt configures git to use it.
-
-### Template routine config
-
-Declare it in the Anthropic console. Rough shape:
-
-```yaml
-name: palimpsest-nightly
-schedule: "0 3 * * *"          # 03:00 daily in user's timezone
-resources:
-  - github_repository:
-      url: https://github.com/sinjens/palimpsest-infra
-      ref: v0.4.0              # pinned tag — never main
-      mount: /workspace/infra
-  - github_repository:
-      url: https://github.com/<user>/palimpsest-personal
-      ref: main
-      mount: /workspace/personal
-      permissions: write
-  - github_repository:
-      url: https://github.com/<user>/palimpsest-work
-      ref: main
-      mount: /workspace/work
-      permissions: write
-  - github_repository:
-      url: https://github.com/<user>/palimpsest-both
-      ref: main
-      mount: /workspace/both
-      permissions: write
-  - github_repository:
-      url: https://github.com/<team-owner>/palimpsest-work-shared
-      ref: main
-      mount: /workspace/shared
-      permissions: write
-```
-
-Routine prompt body:
-
-> Run the Palimpsest nightly compile. For each of these brains, `cd` into it and run `python compile/main.py` then `python compile/supervise.py`:
->
-> - `/workspace/personal`
-> - `/workspace/work`
-> - `/workspace/both`
->
-> Then run promotion from the work brain. From `/workspace/work`, run:
->
-> ```bash
-> PALIMPSEST_BOTH_BRAIN=/workspace/both \
->   PALIMPSEST_WORK_SHARED=/workspace/shared \
->   python compile/promote.py
-> ```
->
-> Each script commits + pushes on its own. If any script exits non-zero, include the last 50 lines of stderr in your completion output and continue with the remaining brains — don't abort the whole run on one failure.
-
-### Cost expectation
-
-One run per day uses 1 of your 15 Max daily routines. Token cost depends on raw log volume; typical estimate is $0.10–$0.50 per nightly run dominated by Sonnet input tokens. If you hit the Max 5-hour window cap on a given day, overflow bills at standard API rates.
-
-### Concurrency across a team
-
-Each contributor has their own routine (in their own Max plan or equivalent). They all push to the same `palimpsest-work-shared`. Collisions are handled by `promote.py`'s rebase-retry — no explicit time staggering needed. Brain repos that are per-contributor (personal/work/both) can't collide because they live under distinct GitHub accounts.
+TL;DR for planning purposes: 1 routine per contributor, ~$0.10–$0.50 per nightly run, counts against plan routine quota (Max: 15/day), each contributor pushes to the same `palimpsest-work-shared` and rebase-retry handles collisions.
