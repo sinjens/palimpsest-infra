@@ -286,6 +286,15 @@ def invoke_claude(prompt: str) -> str:
                 "--model", MODEL,
                 "--name", "[nolog] palimpsest distill",
                 "--tools", "",
+                "--strict-mcp-config",
+                "--mcp-config", '{"mcpServers":{}}',
+                "--append-system-prompt",
+                "You are in pure text-completion mode. No tools are available. "
+                "Do not attempt function calls, MCP calls, or tool invocations. "
+                "Do not write preamble like 'Let me check' or 'I'll look at'. "
+                "Your entire output must be the delimited blocks specified in "
+                "the user prompt, emitted directly at column zero with no "
+                "surrounding prose.",
             ],
             input=prompt,
             capture_output=True,
