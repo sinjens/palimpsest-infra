@@ -285,6 +285,7 @@ def invoke_claude(prompt: str) -> str:
                 CLAUDE_BIN, "-p",
                 "--model", MODEL,
                 "--name", "[nolog] palimpsest distill",
+                "--tools", "",
             ],
             input=prompt,
             capture_output=True,

@@ -1,6 +1,6 @@
 # Palimpsest — Running the compile loop as a Claude Code Routine
 
-This document is for **operators** deploying the nightly compile loop to [Claude Code Routines](https://platform.claude.com) so it runs on Anthropic's infrastructure instead of a contributor's laptop. If you just want to use Palimpsest on your own machine, you don't need any of this — see `INSTALL.md`.
+This document is for **operators** deploying the nightly compile loop to [Claude Code Routines](https://platform.claude.com) so it runs on Anthropic's infrastructure instead of a contributor's computer. If you just want to use Palimpsest on your own machine, you don't need any of this — see `INSTALL.md`.
 
 ## Status: research preview
 
@@ -41,7 +41,7 @@ Routines has **two separate initialization phases**:
 
 ## Setup script
 
-Paste this into the Routine's "setup script" field. It installs gitleaks pinned to a known version, verifies, and makes it available on PATH for all subsequent steps including the Claude Code session.
+Paste this into the Routine's "setup script" field. It installs gitleaks pinned to a known version, verifies, and makes it available on PATH for all subsequent steps including the Claude Code session.  Setup script can be accessed in the environment setting (bottom right in the Routine dialog, create a new env or edit the default)
 
 ```bash
 #!/usr/bin/env bash
@@ -79,7 +79,7 @@ done
 echo "setup: ok"
 ```
 
-If you want signed commits, also mount an SSH signing key as a routine secret and extend the setup script:
+If you want signed commits, also mount an SSH signing key as a routine secret (Add SSH_SIGNING_KEY to the Env vars) and extend the setup script:
 
 ```bash
 # optional: ssh signing

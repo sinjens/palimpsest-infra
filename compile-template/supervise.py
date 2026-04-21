@@ -84,6 +84,7 @@ def invoke_supervisor(prompt: str) -> str:
                 CLAUDE_BIN, "-p",
                 "--model", SUPERVISOR_MODEL,
                 "--name", "[nolog] palimpsest supervise",
+                "--tools", "",
             ],
             input=prompt,
             capture_output=True,
