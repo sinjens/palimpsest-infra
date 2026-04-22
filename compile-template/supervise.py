@@ -343,11 +343,21 @@ def main() -> int:
 
     try:
         response = parse_supervise_response(response_text)
-    except ValueError as e:
-        print(f"ERROR parsing response: {e}", file=sys.stderr)
-        print(f"raw response saved at: {COMPILE_DIR / '.last-supervise-response.txt'}",
-              file=sys.stderr)
-        return 1
+    except ValueError as first_err:
+        print(f"parse failed, retrying once: {first_err}", file=sys.stderr)
+        try:
+            response_text = invoke_supervisor(full_prompt)
+        except Exception as e:
+            print(f"ERROR on retry invocation: {e}", file=sys.stderr)
+            return 1
+        save_last_response(response_text)
+        try:
+            response = parse_supervise_response(response_text)
+        except ValueError as e:
+            print(f"ERROR parsing response (both attempts failed): {e}", file=sys.stderr)
+            print(f"raw response saved at: {COMPILE_DIR / '.last-supervise-response.txt'}",
+                  file=sys.stderr)
+            return 1
 
     summary = (response.get("session_summary") or "").strip()
     print(f"Supervisor summary: {summary[:200]}")

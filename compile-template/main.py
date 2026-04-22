@@ -435,7 +435,13 @@ def compile_session(session_file: Path, prompt_template: str) -> dict:
 
     response_text = invoke_claude(full_prompt)
     _save_last_response(response_text)
-    return parse_delimited_response(response_text)
+    try:
+        return parse_delimited_response(response_text)
+    except ValueError as first_err:
+        print(f"parse failed, retrying once: {first_err}", file=sys.stderr)
+        response_text = invoke_claude(full_prompt)
+        _save_last_response(response_text)
+        return parse_delimited_response(response_text)
 
 
 def apply_edits(response: dict) -> list[tuple[str, str]]:
