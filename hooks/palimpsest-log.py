@@ -131,6 +131,16 @@ _REDACTION_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # Cloud provider / infra tokens
     (re.compile(r"dop_v1_[a-f0-9]{64}"),                                  "[REDACTED:DIGITALOCEAN_TOKEN]"),
     (re.compile(r"dapi[a-f0-9]{32}"),                                     "[REDACTED:DATABRICKS_TOKEN]"),
+    # Entra (Azure AD) app client secret — 40 chars, alphanumerics + ~._-.
+    # Microsoft's generator almost always emits a `~` within positions 2-8,
+    # which is a cheap-and-distinctive fingerprint vs random strings.
+    (re.compile(r"\b[A-Za-z0-9]{2,7}~[A-Za-z0-9_~.-]{32,37}\b"),           "[REDACTED:ENTRA_SECRET]"),
+    # Context-aware catch for CLI output that echoes secrets structurally
+    # even when the value shape doesn't match a known pattern — e.g. az bot
+    # authsetting, az ad app credential reset, az webapp config.
+    (re.compile(r'"clientSecret"\s*:\s*"[^"]+"'),                          '"clientSecret": "[REDACTED:CLIENT_SECRET]"'),
+    (re.compile(r'"value"\s*:\s*"[^"]+"(?=[^}]*"key"\s*:\s*"clientSecret")'),
+                                                                          '"value": "[REDACTED:CLIENT_SECRET]"'),
     # Basic-auth or connection-string URLs with embedded credentials.
     # Matches scheme://user:password@host  (common for db / repo URLs).
     (re.compile(r"\b(?:https?|postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqps?|ftp|ssh|git)://[^\s:/@]+:[^\s/@]+@[A-Za-z0-9.\-]+"),
