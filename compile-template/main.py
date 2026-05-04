@@ -85,12 +85,25 @@ MAX_INLINE_ARTICLES = 25
 # ----- cursor + date range ---------------------------------------------------
 
 
-def read_cursor() -> date:
-    return date.fromisoformat(CURSOR_FILE.read_text(encoding="utf-8").strip())
+def read_cursor() -> tuple[date, str | None]:
+    """Cursor format: line 1 is a date; optional line 2 is a session
+    filename. session=None means the entire date is done; session=<name>
+    means sessions on that date up to and including <name> are done.
+    Backwards-compat: a one-line file (date only) reads as (date, None)."""
+    raw = CURSOR_FILE.read_text(encoding="utf-8").strip()
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    d = date.fromisoformat(lines[0])
+    sess = lines[1] if len(lines) > 1 else None
+    return d, sess
 
 
-def write_cursor(d: date) -> None:
-    CURSOR_FILE.write_text(f"{d.isoformat()}\n", encoding="utf-8")
+def write_cursor(d: date, session_filename: str | None = None) -> None:
+    if session_filename:
+        CURSOR_FILE.write_text(
+            f"{d.isoformat()}\n{session_filename}\n", encoding="utf-8"
+        )
+    else:
+        CURSOR_FILE.write_text(f"{d.isoformat()}\n", encoding="utf-8")
 
 
 def daterange(start: date, end: date):
@@ -543,35 +556,47 @@ def main() -> int:
     prompt_template = PROMPT_FILE.read_text(encoding="utf-8")
 
     today = date.today()
+    cursor_date, cursor_session = read_cursor()
     if args.date:
         start = end = date.fromisoformat(args.date)
+        # Explicit --date overrides any session-level resume point.
+        resume_session: str | None = None
     else:
-        start = read_cursor() + timedelta(days=1)
+        # If a partial-date cursor is set, resume mid-date; otherwise start
+        # the day after the last fully-processed date.
+        start = cursor_date if cursor_session else cursor_date + timedelta(days=1)
         end = today - timedelta(days=1)
+        resume_session = cursor_session
 
     if start > end:
         print(f"Nothing to compile (start={start}, end={end}, cursor already at yesterday).")
         return 0
 
     print(f"Compile plan: {start} .. {end}  (brain={BRAIN_ROOT.name}, model={MODEL})")
+    if resume_session:
+        print(f"Resuming after {start}/{resume_session}")
 
-    session_summaries: list[str] = []
-    cursor_target: date | None = None
-    fatal_error_date: date | None = None
-    # Per-date runs grouped for the changelog. Dict keyed by date.
-    runs_by_date: dict[date, list[dict]] = {}
+    fatal_error: tuple[date, str] | None = None
 
     for d in daterange(start, end):
         sessions = find_sessions_for_date(d)
         if args.session:
             sessions = [s for s in sessions if args.session in s.name]
+        # On the resume date only, skip already-processed sessions.
+        if resume_session and d == start:
+            sessions = [s for s in sessions if s.name > resume_session]
+        # resume_session only applies to the first date in the loop.
+        resume_session = None
+
         if not sessions:
-            # No work for this date; still safe to advance the cursor past it.
-            cursor_target = d
-            runs_by_date.setdefault(d, [])
+            # No (remaining) sessions for this date — advance cursor past it.
+            if not args.dry_run:
+                write_cursor(d, None)
+                if not args.no_commit:
+                    git_commit_changes([])
             continue
+
         print(f"\n=== {d} — {len(sessions)} session(s) ===")
-        day_ok = True
         for session in sessions:
             print(f"  Compiling: {session.name}")
             if args.dry_run:
@@ -584,62 +609,44 @@ def main() -> int:
                 dbg = COMPILE_DIR / ".last-response.txt"
                 if dbg.exists():
                     print(f"    raw response saved at: {dbg}", file=sys.stderr)
-                day_ok = False
-                continue
+                fatal_error = (d, session.name)
+                break
+
             summary = (response.get("session_summary") or "").strip()
-            if summary:
-                session_summaries.append(summary)
             print(f"    Summary: {summary[:160]}")
             applied = apply_edits(response)
             for action, identifier in applied:
                 print(f"    {action:<6}  {identifier}")
-            runs_by_date.setdefault(d, []).append({
+
+            # P1: commit each session as it completes so a later failure
+            # cannot retroactively void already-done work.
+            run_record = {
                 "time": datetime.now().strftime("%H:%M"),
                 "edits": applied,
                 "summary": summary,
-            })
-        if not day_ok:
-            # Don't advance the cursor past a date that had any failure — retry
-            # that date on the next run.
-            fatal_error_date = d
+            }
+            update_changelog(d, [run_record])
+            regenerate_index()
+            write_cursor(d, session.name)
+            if not args.no_commit:
+                git_commit_changes([summary] if summary else [])
+
+        if fatal_error:
             break
-        cursor_target = d
 
     if args.dry_run:
         print("\n(dry-run: no index regen, no cursor advance, no commit)")
         return 0
 
-    if cursor_target is None:
+    if fatal_error:
+        d, sname = fatal_error
         print(
-            "\nNo sessions successfully compiled; cursor not advanced."
-            + (f" First error at {fatal_error_date}." if fatal_error_date else "")
+            f"\nStopped at {d}/{sname} due to an error. "
+            "Cursor preserves progress through last successful session — re-run to continue."
         )
-        return 1 if fatal_error_date else 0
+        return 1
 
-    # Update the changelog (one section per compile date).
-    for d in sorted(runs_by_date):
-        if d > cursor_target:
-            continue  # don't record dates we didn't complete
-        update_changelog(d, runs_by_date[d])
-
-    regenerate_index()
-    write_cursor(cursor_target)
-    print(f"\nIndex + changelog regenerated. Cursor advanced to {cursor_target}.")
-    if fatal_error_date:
-        print(
-            f"NOTE: Stopped at {fatal_error_date} due to an error. "
-            "Re-run after fixing to continue from there."
-        )
-
-    if args.no_commit:
-        print("(--no-commit: staged changes not committed)")
-        return 0
-
-    if git_commit_changes(session_summaries):
-        print("Committed locally. Review with `git log -1` and push when ready.")
-    else:
-        print("Nothing to commit.")
-
+    print("\nCompile range processed cleanly.")
     return 0
 
 
