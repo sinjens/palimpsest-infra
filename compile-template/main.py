@@ -286,6 +286,7 @@ def invoke_claude(prompt: str) -> str:
         "--tools", "",
         "--strict-mcp-config",
         "--mcp-config", '{"mcpServers":{}}',
+        "--setting-sources", "project,local",
         "--append-system-prompt",
         "You are a text-completion service for an automated pipeline. "
         "Your stdout is parsed by a Python script — no human reads it, "
