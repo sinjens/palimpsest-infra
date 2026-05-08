@@ -156,6 +156,27 @@ _SCOPE_PREFIXES = {
 
 
 def main() -> int:
+    """Outer wrapper: never propagate an exception to Claude Code. Any
+    crash inside the hook becomes a logged error in palimpsest/errors.log
+    and a clean exit 0. The visible "non-blocking status code: Traceback"
+    UI message that Claude Code shows on hook failure was the symptom of
+    an unhandled exception escaping this function — we now swallow them
+    here and capture the trace so it can be diagnosed offline."""
+    try:
+        return _main()
+    except BaseException as exc:
+        import traceback as _tb
+        try:
+            _log_error(
+                f"hook crashed in mode={sys.argv[1] if len(sys.argv) > 1 else '?'}: "
+                f"{type(exc).__name__}: {exc}\n{_tb.format_exc()}"
+            )
+        except BaseException:
+            pass
+        return 0
+
+
+def _main() -> int:
     if len(sys.argv) < 2:
         return 0
     mode = sys.argv[1]
