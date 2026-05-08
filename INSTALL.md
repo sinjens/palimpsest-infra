@@ -287,7 +287,7 @@ if ! command -v gitleaks >/dev/null 2>&1; then
   echo "Install with your platform's package manager (winget/brew/apt) and retry." >&2
   exit 1
 fi
-exec gitleaks protect --staged --no-banner
+exec gitleaks git --pre-commit --no-banner
 EOF
 chmod +x "$BRAIN/.git/hooks/pre-commit"
 ```
