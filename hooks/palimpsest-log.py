@@ -253,7 +253,13 @@ def _main() -> int:
         log_path = _resolve_log_path(logs_root, session_id, title)
         new_file = not log_path.exists()
 
-        with log_path.open("a", encoding="utf-8") as f:
+        # errors="replace" handles lone Unicode surrogates that sometimes
+        # ride in via the Windows clipboard when pasting between Claude
+        # sessions (e.g. \udc9d). The default errors="strict" raises
+        # UnicodeEncodeError mid-write, crashing the hook. Replacement
+        # is lossy but bounded — original chars remain in the .jsonl
+        # transcript Claude Code maintains separately.
+        with log_path.open("a", encoding="utf-8", errors="replace") as f:
             if new_file:
                 header_name = title if title else session_id
                 f.write(f"# Claude session: {header_name}\n\n")
@@ -268,7 +274,9 @@ def _main() -> int:
 
         if jsonl_content is not None:
             try:
-                log_path.with_suffix(".jsonl").write_text(jsonl_content, encoding="utf-8")
+                log_path.with_suffix(".jsonl").write_text(
+                    jsonl_content, encoding="utf-8", errors="replace"
+                )
             except OSError:
                 pass  # MD already written; JSONL mirror is nice-to-have
 
