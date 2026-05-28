@@ -85,6 +85,18 @@ _COMMIT_TIMEOUT_SECONDS = 10
 # it runs out-of-band, so generosity here doesn't delay Claude's next turn.
 _PUSH_TIMEOUT_SECONDS = 15
 _REBASE_TIMEOUT_SECONDS = 15
+# Per-brain push lockfiles so concurrent sessions don't fire overlapping
+# pushes to the same brain repo and contend on .git/refs/*.lock (or stack
+# up pack-objects children that pin the CPU). The detached push child
+# owns releasing its lock; the parent only holds it across its brief
+# commit window.
+_LOCKS_DIR = Path.home() / ".claude" / "palimpsest" / ".locks"
+# Cap git's pack-objects parallelism on the hook's pushes; on a 12-core
+# box a default-fanout pack peaked at ~50% total CPU during the push.
+# Applied via `-c`, not git config, so manual pushes from the user's
+# shell keep their normal speed.
+_PUSH_PACK_THREADS = 2
+_PUSH_PACK_COMPRESSION = 1
 
 
 def _no_window_kwargs() -> dict:
@@ -187,7 +199,8 @@ def _main() -> int:
     # stdin.
     if mode == "push-retry":
         if len(sys.argv) >= 3 and sys.argv[2]:
-            _push_with_rebase_retry(Path(sys.argv[2]))
+            lock_arg = sys.argv[3] if len(sys.argv) >= 4 and sys.argv[3] else None
+            _push_with_rebase_retry(Path(sys.argv[2]), Path(lock_arg) if lock_arg else None)
         return 0
 
     try:
@@ -467,6 +480,61 @@ def _pull_brains(config: dict, session_id: str) -> None:
             _log_error(f"pull error [{brain_name}]: {e}")
 
 
+def _is_pid_alive(pid: int) -> bool:
+    """True if a process with this PID currently exists. Cross-platform via
+    `os.kill(pid, 0)` — an existence probe (Windows treats signal 0 as a
+    no-op). Returns False on any error too; we only skip a push when we're
+    confident another one is already running."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, OSError):
+        return False
+    return True
+
+
+def _acquire_push_lock(brain_path: Path) -> Path | None:
+    """Try to take a per-brain push lockfile. Returns the path on success,
+    or None if another push for this brain is already in flight (or on FS
+    error — callers treat both the same: skip this session's push and let
+    the next one catch up). Stale locks (holder PID dead) are reaped."""
+    try:
+        _LOCKS_DIR.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    lock = _LOCKS_DIR / (_sanitize(brain_path.name) + ".push.lock")
+    for _ in range(2):
+        try:
+            # 'x' = exclusive create; atomic enough on both NTFS and POSIX
+            # for this purpose.
+            with lock.open("x", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+            return lock
+        except FileExistsError:
+            try:
+                held = int((lock.read_text(encoding="utf-8") or "0").strip() or "0")
+            except (OSError, ValueError):
+                held = 0
+            if _is_pid_alive(held):
+                return None  # in flight — next session catches up
+            try:
+                lock.unlink()
+            except OSError:
+                return None
+    return None
+
+
+def _release_push_lock(lock_path: Path | None) -> None:
+    """Best-effort lock release; safe with None or a missing file."""
+    if not lock_path:
+        return
+    try:
+        lock_path.unlink()
+    except OSError:
+        pass
+
+
 def _commit_and_push_async(brain_path: Path, commit_msg: str) -> None:
     """Stage + commit synchronously (fast), then fire a detached push.
 
@@ -474,9 +542,19 @@ def _commit_and_push_async(brain_path: Path, commit_msg: str) -> None:
     want to know right away whether anything was actually staged. Push is
     detached so the hook can return while the network round-trip finishes
     in the background — Claude never waits for git over the wire.
+
+    Per-brain push lock: if another push for this brain is already in
+    flight (typically a previous session whose pack-objects is still
+    running), skip the whole commit+push. The next session's `git add -A`
+    picks up everything since the last successful run, so nothing is lost.
     """
     if not (brain_path / ".git").exists():
         return
+
+    lock = _acquire_push_lock(brain_path)
+    if lock is None:
+        return  # another push is in flight (or no lock available); skip
+
     try:
         subprocess.run(
             ["git", "-C", str(brain_path), "add", "-A"],
@@ -490,6 +568,7 @@ def _commit_and_push_async(brain_path: Path, commit_msg: str) -> None:
             **_no_window_kwargs(),
         )
         if diff.returncode == 0:
+            _release_push_lock(lock)
             return  # nothing staged, skip the push
         subprocess.run(
             ["git", "-C", str(brain_path), "commit", "-m", commit_msg],
@@ -499,9 +578,11 @@ def _commit_and_push_async(brain_path: Path, commit_msg: str) -> None:
         )
     except subprocess.CalledProcessError as e:
         _log_error(f"commit failed [{brain_path.name}]: {(e.stderr or '').strip()[:500]}")
+        _release_push_lock(lock)
         return
     except (subprocess.TimeoutExpired, OSError) as e:
         _log_error(f"commit error [{brain_path.name}]: {e}")
+        _release_push_lock(lock)
         return
 
     # Detach push so the network delay doesn't block the hook. The child
@@ -525,64 +606,86 @@ def _commit_and_push_async(brain_path: Path, commit_msg: str) -> None:
         popen_kwargs["start_new_session"] = True
     try:
         subprocess.Popen(
-            [sys.executable, str(Path(__file__).resolve()), "push-retry", str(brain_path)],
+            [sys.executable, str(Path(__file__).resolve()), "push-retry", str(brain_path), str(lock)],
             **popen_kwargs,
         )
     except OSError as e:
         _log_error(f"push spawn failed [{brain_path.name}]: {e}")
+        _release_push_lock(lock)
 
 
-def _push_with_rebase_retry(brain_path: Path) -> None:
+def _push_with_rebase_retry(brain_path: Path, lock_path: Path | None = None) -> None:
     """Push `brain_path` to its remote; on non-fast-forward rejection,
     pull --rebase --autostash and retry the push exactly once.
 
     Runs out-of-band in a detached child (spawned by _commit_and_push_async)
-    so network round-trips never delay the hook's parent process. Fails
-    silently to errors.log — the next Stop will retry, and `git status`
-    remains the source of truth for the user.
+    so network round-trips never delay the hook's parent process. Holds the
+    per-brain push lock for its lifetime so concurrent sessions skip rather
+    than stack. Fails silently to errors.log — the next Stop will retry, and
+    `git status` remains the source of truth for the user.
     """
-    if not (brain_path / ".git").exists():
-        return
-
-    def _run(args: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
-        return subprocess.run(
-            ["git", "-C", str(brain_path), *args],
-            capture_output=True, text=True, timeout=timeout,
-            **_no_window_kwargs(),
-        )
+    # Take ownership of the lock from the (already-exited) parent: rewrite
+    # the PID so a concurrent session's alive-check sees this long-lived
+    # child, not the short-lived parent that just exited.
+    if lock_path:
+        try:
+            lock_path.write_text(str(os.getpid()), encoding="utf-8")
+        except OSError:
+            pass
 
     try:
-        first = _run(["push"], _PUSH_TIMEOUT_SECONDS)
-        if first.returncode == 0:
+        if not (brain_path / ".git").exists():
             return
 
-        combined = (first.stderr or "") + (first.stdout or "")
-        diverged = any(
-            marker in combined
-            for marker in ("non-fast-forward", "rejected", "fetch first", "Updates were rejected")
-        )
-        if not diverged:
-            _log_error(f"push failed [{brain_path.name}]: {combined.strip()[:500]}")
-            return
+        # Cap pack-objects threads + compression on the hook's pushes only,
+        # via `-c`, so manual pushes from the user's shell keep their
+        # normal performance.
+        push_cfg = [
+            "-c", f"pack.threads={_PUSH_PACK_THREADS}",
+            "-c", f"pack.compression={_PUSH_PACK_COMPRESSION}",
+        ]
 
-        rebase = _run(["pull", "--rebase", "--autostash"], _REBASE_TIMEOUT_SECONDS)
-        if rebase.returncode != 0:
-            _log_error(
-                f"push-retry rebase failed [{brain_path.name}]: "
-                f"{(rebase.stderr or rebase.stdout or '').strip()[:500]}"
+        def _run(args: list[str], timeout: int) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["git", *push_cfg, "-C", str(brain_path), *args],
+                capture_output=True, text=True, timeout=timeout,
+                **_no_window_kwargs(),
             )
-            return
 
-        retry = _run(["push"], _PUSH_TIMEOUT_SECONDS)
-        if retry.returncode != 0:
-            _log_error(
-                f"push-retry push failed [{brain_path.name}]: "
-                f"{(retry.stderr or retry.stdout or '').strip()[:500]}"
+        try:
+            first = _run(["push"], _PUSH_TIMEOUT_SECONDS)
+            if first.returncode == 0:
+                return
+
+            combined = (first.stderr or "") + (first.stdout or "")
+            diverged = any(
+                marker in combined
+                for marker in ("non-fast-forward", "rejected", "fetch first", "Updates were rejected")
             )
-    except subprocess.TimeoutExpired:
-        _log_error(f"push-retry timeout [{brain_path.name}]")
-    except OSError as e:
-        _log_error(f"push-retry error [{brain_path.name}]: {e}")
+            if not diverged:
+                _log_error(f"push failed [{brain_path.name}]: {combined.strip()[:500]}")
+                return
+
+            rebase = _run(["pull", "--rebase", "--autostash"], _REBASE_TIMEOUT_SECONDS)
+            if rebase.returncode != 0:
+                _log_error(
+                    f"push-retry rebase failed [{brain_path.name}]: "
+                    f"{(rebase.stderr or rebase.stdout or '').strip()[:500]}"
+                )
+                return
+
+            retry = _run(["push"], _PUSH_TIMEOUT_SECONDS)
+            if retry.returncode != 0:
+                _log_error(
+                    f"push-retry push failed [{brain_path.name}]: "
+                    f"{(retry.stderr or retry.stdout or '').strip()[:500]}"
+                )
+        except subprocess.TimeoutExpired:
+            _log_error(f"push-retry timeout [{brain_path.name}]")
+        except OSError as e:
+            _log_error(f"push-retry error [{brain_path.name}]: {e}")
+    finally:
+        _release_push_lock(lock_path)
 
 
 def _purge_session(session_id: str, config: dict) -> None:
