@@ -4,6 +4,12 @@ For each session log newer than the cursor, feeds (session + current palimpsest
 state) to Sonnet via `claude -p`, applies the returned edit set to the
 `palimpsest/` tree, regenerates `index.md`, and advances the cursor.
 
+Libraries over MAX_INLINE_ARTICLES compile in two stages: a targeting call
+(session + TOC → relevant article slugs) followed by the edit call with those
+articles inlined in full. A blind-update guard re-runs the edit call once if
+it touched an article that wasn't inlined, and drops any edit that would
+still overwrite unseen content.
+
 Runs locally — iterate on prompts here before deploying as an Anthropic
 managed agent. Git commits are made locally, NOT pushed — review the diff
 before committing upstream.
@@ -78,8 +84,39 @@ MODEL = os.environ.get("PALIMPSEST_MODEL", "sonnet")
 CLAUDE_TIMEOUT_SECONDS = 600
 
 # Generous cap — articles we include verbatim in the prompt. Beyond this the
-# full-article context is omitted and only the TOC is included.
+# library is too big to inline wholesale and synthesis becomes two-stage:
+# a targeting call picks the relevant articles, which are then inlined in
+# full for the edit call. (Single-stage blind mode — TOC only, updates
+# written against articles the model never read — silently destroyed
+# article content for weeks before this existed. Never go back to it.)
 MAX_INLINE_ARTICLES = 25
+
+# Cap on how many articles the targeting stage may select for inlining.
+MAX_TARGET_ARTICLES = 10
+
+# Stage-1 prompt. Scope-agnostic (routing needs no scope rules), so it
+# lives here rather than in prompts/ — one less file to keep in sync
+# across brains.
+_TARGETING_PROMPT = """\
+You are the article-routing stage of an automated knowledge-compile \
+pipeline. Your input below has two parts: (1) the table of contents of an \
+existing article library, (2) one session log. Identify which EXISTING \
+articles this session's durable knowledge would update or meaningfully \
+extend.
+
+Output exactly one block and nothing else:
+
+@@@TARGETS
+palimpsest/<path-exactly-as-in-the-toc>.md
+@@@END
+
+Rules:
+- At most {max_targets} paths, one per line, copied verbatim from the TOC.
+- List only articles whose CONTENT this session would change or extend — \
+not everything vaguely on-topic.
+- If the session touches no existing article (all-new knowledge, or \
+nothing durable), emit the two marker lines with nothing between them.
+"""
 
 
 # ----- cursor + date range ---------------------------------------------------
@@ -427,28 +464,81 @@ def _save_last_response(text: str) -> Path:
 # ----- compilation core ------------------------------------------------------
 
 
-def compile_session(session_file: Path, prompt_template: str) -> dict:
-    session_content = session_file.read_text(encoding="utf-8")
-    toc = build_toc()
-    articles = list_existing_articles()
+def parse_targets(text: str) -> list[str]:
+    """Parse a @@@TARGETS block into a list of palimpsest/ paths. Tolerant
+    of backticks, list bullets, and stray prose; anything that doesn't
+    resolve to a `palimpsest/...` path is ignored."""
+    targets: list[str] = []
+    in_block = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "@@@TARGETS":
+            in_block = True
+            continue
+        if stripped == "@@@END":
+            if in_block:
+                break
+            continue
+        if not in_block:
+            continue
+        cleaned = stripped.strip("`").lstrip("-* ").strip("`").strip()
+        if cleaned.startswith("palimpsest/"):
+            targets.append(cleaned)
+    return list(dict.fromkeys(targets))
 
-    if articles and len(articles) <= MAX_INLINE_ARTICLES:
+
+def select_target_articles(
+    session_content: str, toc: str, articles: list[Path]
+) -> list[Path]:
+    """Stage 1 of two-stage synthesis: ask the model which existing
+    articles this session touches, so stage 2 can inline their full text.
+    Fails open to [] — the blind-update guard in compile_session catches
+    anything the targeting missed."""
+    by_rel = {a.relative_to(BRAIN_ROOT).as_posix(): a for a in articles}
+    prompt = (
+        _TARGETING_PROMPT.format(max_targets=MAX_TARGET_ARTICLES)
+        + "\n---\n\n# Library TOC\n\n"
+        + toc
+        + "\n\n# Session log\n\n"
+        + session_content
+        + "\n"
+    )
+    try:
+        targets = parse_targets(invoke_claude(prompt))
+    except Exception as e:
+        print(f"    targeting stage failed ({e}); relying on blind-update guard",
+              file=sys.stderr)
+        return []
+    return [by_rel[t] for t in targets if t in by_rel][:MAX_TARGET_ARTICLES]
+
+
+def _build_synthesis_prompt(
+    prompt_template: str,
+    toc: str,
+    inlined: list[Path],
+    total_articles: int,
+    session_rel: str,
+    session_content: str,
+) -> str:
+    if inlined:
         existing_snippets = "\n\n".join(
             f"### {a.relative_to(BRAIN_ROOT).as_posix()}\n\n"
             + a.read_text(encoding="utf-8")
-            for a in articles
-        )
-    elif articles:
-        existing_snippets = (
-            f"(There are {len(articles)} existing articles — too many to include "
-            "inline. Refer to the TOC above; if you would update a specific article, "
-            "reference it by slug and the caller will include its content on the "
-            "next pass.)"
+            for a in inlined
         )
     else:
-        existing_snippets = "(no existing articles)"
-
-    session_rel = session_file.relative_to(BRAIN_ROOT).as_posix()
+        existing_snippets = "(no existing articles)" if total_articles == 0 else (
+            "(none selected as relevant to this session)"
+        )
+    if total_articles > len(inlined):
+        existing_snippets += (
+            f"\n\n(The library has {total_articles} articles; shown in full above "
+            "are only those selected as relevant to this session. If the session "
+            "updates an article that is NOT shown, emit the `action: update` "
+            "anyway — the pipeline detects it and re-runs you with that "
+            "article's full text so the update merges instead of replacing. "
+            "Never reconstruct an unseen article's content from its TOC line.)"
+        )
     user_input = (
         "# Current palimpsest index\n\n"
         f"{toc}\n\n"
@@ -458,8 +548,10 @@ def compile_session(session_file: Path, prompt_template: str) -> dict:
         f"Session file: `{session_rel}`\n\n"
         f"{session_content}\n"
     )
-    full_prompt = prompt_template + "\n\n---\n\n" + user_input
+    return prompt_template + "\n\n---\n\n" + user_input
 
+
+def _invoke_and_parse(full_prompt: str) -> dict:
     response_text = invoke_claude(full_prompt)
     _save_last_response(response_text)
     try:
@@ -469,6 +561,82 @@ def compile_session(session_file: Path, prompt_template: str) -> dict:
         response_text = invoke_claude(full_prompt)
         _save_last_response(response_text)
         return parse_delimited_response(response_text)
+
+
+def _blind_edit_paths(response: dict, shown: set[str]) -> list[str]:
+    """Paths of create/update edits aimed at an EXISTING article whose full
+    text was not in the prompt. Writing those would replace content the
+    model never read. (create counts too: apply_edits converts create →
+    update when the target exists.)"""
+    blind: list[str] = []
+    for e in response.get("edits", []):
+        path = e.get("path", "")
+        if (
+            e.get("action") in ("create", "update")
+            and path
+            and path not in shown
+            and (BRAIN_ROOT / path).exists()
+        ):
+            blind.append(path)
+    return list(dict.fromkeys(blind))
+
+
+def compile_session(session_file: Path, prompt_template: str) -> dict:
+    session_content = session_file.read_text(encoding="utf-8")
+    toc = build_toc()
+    articles = list_existing_articles()
+    session_rel = session_file.relative_to(BRAIN_ROOT).as_posix()
+
+    # Small library: inline everything, single call (original behavior).
+    # Big library: two-stage — target, then edit with targets inlined.
+    if len(articles) <= MAX_INLINE_ARTICLES:
+        inlined = list(articles)
+    else:
+        inlined = select_target_articles(session_content, toc, articles)
+        if inlined:
+            print(f"    targeting: {len(inlined)} article(s) inlined", file=sys.stderr)
+
+    response = _invoke_and_parse(_build_synthesis_prompt(
+        prompt_template, toc, inlined, len(articles), session_rel, session_content
+    ))
+
+    if len(articles) <= MAX_INLINE_ARTICLES:
+        return response  # everything was shown; nothing can be blind
+
+    shown = {a.relative_to(BRAIN_ROOT).as_posix() for a in inlined}
+    blind = _blind_edit_paths(response, shown)
+    if blind:
+        # Corrective pass: give the model exactly what it tried to edit
+        # unseen, once. Edits that are STILL blind after this get dropped.
+        print(
+            f"    blind-update guard: re-running with {len(blind)} "
+            f"missed article(s) inlined: {', '.join(blind)}",
+            file=sys.stderr,
+        )
+        inlined = list(dict.fromkeys(inlined + [BRAIN_ROOT / p for p in blind]))
+        response = _invoke_and_parse(_build_synthesis_prompt(
+            prompt_template, toc, inlined, len(articles), session_rel, session_content
+        ))
+        shown = {a.relative_to(BRAIN_ROOT).as_posix() for a in inlined}
+        still_blind = set(_blind_edit_paths(response, shown))
+        if still_blind:
+            kept = [
+                e for e in response["edits"]
+                if not (e.get("path") in still_blind
+                        and e.get("action") in ("create", "update"))
+            ]
+            for path in sorted(still_blind):
+                print(
+                    f"    WARNING: dropping blind edit to {path} "
+                    "(article never inlined; refusing to overwrite unseen content)",
+                    file=sys.stderr,
+                )
+                kept.append({
+                    "action": "skip",
+                    "reason": f"blind-update guard: dropped edit to unseen {path}",
+                })
+            response["edits"] = kept
+    return response
 
 
 def apply_edits(response: dict) -> list[tuple[str, str]]:
