@@ -26,15 +26,30 @@ to `~/source/palimpsest-unclassified` and can be overridden via the
 optional `unclassified_path = "..."` key in config.toml.
 
 MD = condensed human-readable view (user prompts + Claude text + plans).
-JSONL = byte-for-byte copy of the Claude Code transcript (full fidelity
-for the downstream compile loop). Both pass through the same write-time
-redaction pass as a belt-and-suspenders complement to gitleaks on push.
+JSONL = full-fidelity transcript, sharded by day. Claude Code's own
+transcript file is cumulative (one file per session, growing forever), so
+mirroring it wholesale made every day's shard a full re-snapshot — a
+7-week session cost ~3 GB that way. Instead we track a per-session byte
+offset (~/.claude/palimpsest/.jsonl-state/) and append only the lines
+added since the previous Stop. Concatenating a session's shards in date
+order reconstructs the sanitized transcript. Each shard opens with a
+`palimpsest-shard` marker line: kind=delta continues the stream from
+sourceOffset; kind=full restarts it from byte 0 (source transcript was
+rewritten — rewind/fork — or the session predates offset tracking) and
+supersedes ALL of the session's earlier shards. Bookkeeping entry types
+(file-history-snapshot rewind checkpoints, permission-mode, ... — see
+_BOOKKEEPING_ENTRY_TYPES) are dropped in every log_tool_calls mode.
+
+Both files pass through the same write-time redaction pass as a
+belt-and-suspenders complement to gitleaks on push.
 """
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 import tomllib
 from datetime import datetime
 from pathlib import Path
@@ -76,6 +91,28 @@ CONFIG_PATH = Path.home() / ".claude" / "palimpsest" / "config.toml"
 _NUDGED_DIR = Path.home() / ".claude" / "palimpsest" / ".nudged"
 # Per-session markers so we only pull each brain once per session.
 _PULLED_DIR = Path.home() / ".claude" / "palimpsest" / ".pulled"
+# Per-session JSONL shard state: how many bytes of the source transcript
+# earlier shards already carry, plus a fingerprint of the tail of that
+# prefix so we notice when Claude Code rewrites the file under us.
+_JSONL_STATE_DIR = Path.home() / ".claude" / "palimpsest" / ".jsonl-state"
+# Bytes hashed immediately before the consumed offset for that check.
+_JSONL_FP_WINDOW = 4096
+# Transcript entry types that are session bookkeeping, not conversation —
+# dropped from shards in every log_tool_calls mode. file-history-snapshot
+# alone (Claude Code's rewind checkpoints: full copies of every edited
+# file) measured 61% of a large real session's bytes. Unknown future
+# types pass through: fidelity-first.
+_BOOKKEEPING_ENTRY_TYPES = {
+    "file-history-snapshot",
+    "queue-operation",
+    "permission-mode",
+    "agent-name",
+    "bridge-session",
+    "mode",
+    "last-prompt",
+    "custom-title",
+    "progress",
+}
 # Where auto-sync (and other) errors get appended.
 _ERRORS_LOG = Path.home() / ".claude" / "palimpsest" / "errors.log"
 # Hard timeout on network ops so a flaky connection never hangs the hook.
@@ -91,6 +128,11 @@ _REBASE_TIMEOUT_SECONDS = 15
 # owns releasing its lock; the parent only holds it across its brief
 # commit window.
 _LOCKS_DIR = Path.home() / ".claude" / "palimpsest" / ".locks"
+# A legitimate push holds its lock for seconds; a lock older than this is
+# a leftover from a dead process and gets reaped regardless of what the
+# PID probe says (PIDs get recycled, especially on Windows). This is what
+# un-wedges pushes if a stale lock ever survives the liveness check.
+_LOCK_STALE_SECONDS = 900
 # Cap git's pack-objects parallelism on the hook's pushes; on a 12-core
 # box a default-fanout pack peaked at ~50% total CPU during the push.
 # Applied via `-c`, not git config, so manual pushes from the user's
@@ -233,16 +275,23 @@ def _main() -> int:
     # Pre-compute the shared content once so we don't re-read the transcript
     # per brain target when scope=both.
     claude_text: str | None = None
-    jsonl_content: str | None = None
+    jsonl_chunk: str | None = None
+    jsonl_kind = "delta"
+    jsonl_start = 0
+    jsonl_state_update: tuple[int, str] | None = None
     if mode == "stop" and transcript_path:
         text = _last_assistant_text(Path(transcript_path))
         if text.strip():
             claude_text = _redact(text)
-        try:
-            raw_jsonl = Path(transcript_path).read_text(encoding="utf-8")
-            jsonl_content = _redact(_sanitize_jsonl(raw_jsonl, config.get("log_tool_calls", "none")))
-        except OSError:
-            pass
+        delta = _transcript_delta(Path(transcript_path), session_id)
+        if delta is not None:
+            raw_chunk, jsonl_start, new_offset, new_fp, jsonl_kind = delta
+            jsonl_chunk = _redact(_sanitize_jsonl(raw_chunk, config.get("log_tool_calls", "none")))
+            jsonl_state_update = (new_offset, new_fp)
+    # State only advances after the shard write succeeds (or there was
+    # nothing left to write post-filtering); on write failure the same
+    # source bytes are retried next Stop.
+    jsonl_write_ok = jsonl_chunk is not None and jsonl_chunk == ""
 
     prompt_text: str | None = None
     if mode == "prompt":
@@ -285,13 +334,28 @@ def _main() -> int:
             elif claude_text is not None:
                 f.write(f"### [{now:%H:%M:%S}] Claude\n\n{claude_text}\n\n---\n\n")
 
-        if jsonl_content is not None:
+        if jsonl_chunk:
+            shard = log_path.with_suffix(".jsonl")
             try:
-                log_path.with_suffix(".jsonl").write_text(
-                    jsonl_content, encoding="utf-8", errors="replace"
-                )
+                if jsonl_kind == "full":
+                    # Restarted stream: overwrite today's shard (its earlier
+                    # deltas are part of the superseded history too).
+                    shard.write_text(
+                        _shard_marker("full", 0, session_id) + jsonl_chunk,
+                        encoding="utf-8", errors="replace",
+                    )
+                else:
+                    new_shard = not shard.exists()
+                    with shard.open("a", encoding="utf-8", errors="replace") as jf:
+                        if new_shard:
+                            jf.write(_shard_marker("delta", jsonl_start, session_id))
+                        jf.write(jsonl_chunk)
+                jsonl_write_ok = True
             except OSError:
-                pass  # MD already written; JSONL mirror is nice-to-have
+                pass  # MD already written; JSONL shard is nice-to-have
+
+    if jsonl_state_update is not None and jsonl_write_ok:
+        _write_jsonl_state(session_id, *jsonl_state_update)
 
     # After writing, fire an async commit+push back to the brain's remote.
     # Skipped for unset scope (fallback folder isn't a git repo) and nolog
@@ -481,15 +545,45 @@ def _pull_brains(config: dict, session_id: str) -> None:
 
 
 def _is_pid_alive(pid: int) -> bool:
-    """True if a process with this PID currently exists. Cross-platform via
-    `os.kill(pid, 0)` — an existence probe (Windows treats signal 0 as a
-    no-op). Returns False on any error too; we only skip a push when we're
-    confident another one is already running."""
+    """True if a process with this PID currently exists.
+
+    POSIX: `os.kill(pid, 0)` is the standard existence probe. Windows:
+    os.kill has NO probe semantics — any non-CTRL signal value is routed
+    to TerminateProcess (i.e. it kills instead of probing), and on this
+    ARM64 Python the failed-open path raises SystemError besides — so we
+    probe via OpenProcess + GetExitCodeProcess instead. Returns False on
+    any error; the lock-age TTL in _acquire_push_lock is the backstop for
+    a probe that's wrong (e.g. PID recycled onto an unrelated process)."""
     if pid <= 0:
         return False
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            code = wintypes.DWORD()
+            ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+            return bool(ok) and code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
-    except (ProcessLookupError, OSError):
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists, owned by another user
+    except OSError:
         return False
     return True
 
@@ -516,7 +610,12 @@ def _acquire_push_lock(brain_path: Path) -> Path | None:
                 held = int((lock.read_text(encoding="utf-8") or "0").strip() or "0")
             except (OSError, ValueError):
                 held = 0
-            if _is_pid_alive(held):
+            stale = False
+            try:
+                stale = (time.time() - lock.stat().st_mtime) > _LOCK_STALE_SECONDS
+            except OSError:
+                pass
+            if not stale and _is_pid_alive(held):
                 return None  # in flight — next session catches up
             try:
                 lock.unlink()
@@ -714,12 +813,13 @@ def _purge_session(session_id: str, config: dict) -> None:
             except OSError:
                 pass
 
-    try:
-        marker = _NUDGED_DIR / session_id
-        if marker.exists():
-            marker.unlink()
-    except OSError:
-        pass
+    for marker_dir in (_NUDGED_DIR, _JSONL_STATE_DIR):
+        try:
+            marker = marker_dir / _sanitize(session_id)
+            if marker.exists():
+                marker.unlink()
+        except OSError:
+            pass
 
 
 def _resolve_log_path(logs_root: Path, session_id: str, title: str | None) -> Path:
@@ -802,6 +902,86 @@ def _redact(text: str) -> str:
     return text
 
 
+def _read_jsonl_state(session_id: str) -> tuple[int, str] | None:
+    """Return (consumed_offset, fingerprint_hex) for this session, or None
+    when the session has no shard state yet (or the file is unreadable —
+    treated the same: restart with a full shard)."""
+    try:
+        data = json.loads(
+            (_JSONL_STATE_DIR / _sanitize(session_id)).read_text(encoding="utf-8")
+        )
+        return int(data["offset"]), str(data["fp"])
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _write_jsonl_state(session_id: str, offset: int, fp: str) -> None:
+    try:
+        _JSONL_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        (_JSONL_STATE_DIR / _sanitize(session_id)).write_text(
+            json.dumps({"offset": offset, "fp": fp}), encoding="utf-8"
+        )
+    except OSError:
+        pass  # worst case: next Stop re-emits a full shard
+
+
+def _shard_marker(kind: str, source_offset: int, session_id: str) -> str:
+    """First line of every shard file. Lets any consumer reconstruct or
+    validate without out-of-band state: concatenate a session's shards in
+    date order, restarting from scratch at each kind=full marker."""
+    return json.dumps({
+        "type": "palimpsest-shard",
+        "kind": kind,
+        "sourceOffset": source_offset,
+        "sessionId": session_id,
+    }) + "\n"
+
+
+def _transcript_delta(
+    transcript: Path, session_id: str
+) -> tuple[str, int, int, str, str] | None:
+    """Read only what the source transcript gained since the last Stop.
+
+    Returns (chunk, start, new_offset, new_fp, kind), or None when there is
+    nothing new (or the file is unreadable). kind="delta" when the
+    previously-consumed prefix is intact — chunk holds just the new lines,
+    starting at byte `start`. kind="full" when the prefix check failed
+    (transcript rewritten by rewind/fork, state lost, or a session that
+    predates offset tracking) — chunk restarts from byte 0 and the caller
+    writes a shard that supersedes all earlier ones.
+
+    Only complete lines (ending in \\n) are consumed; a trailing partial
+    line — Claude Code may be mid-write — is left for the next Stop. All
+    offsets are byte positions in the source file; the fingerprint covers
+    the last _JSONL_FP_WINDOW bytes of the consumed prefix.
+    """
+    state = _read_jsonl_state(session_id)
+    try:
+        with transcript.open("rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            kind, start = "full", 0
+            if state is not None:
+                offset, fp = state
+                if 0 < offset <= size:
+                    w = min(_JSONL_FP_WINDOW, offset)
+                    f.seek(offset - w)
+                    if hashlib.sha1(f.read(w)).hexdigest() == fp:
+                        kind, start = "delta", offset
+            f.seek(start)
+            data = f.read()
+            nl = data.rfind(b"\n")
+            if nl < 0:
+                return None  # no complete new line yet
+            data = data[: nl + 1]
+            new_offset = start + len(data)
+            w = min(_JSONL_FP_WINDOW, new_offset)
+            f.seek(new_offset - w)
+            new_fp = hashlib.sha1(f.read(w)).hexdigest()
+    except OSError:
+        return None
+    return data.decode("utf-8", errors="replace"), start, new_offset, new_fp, kind
+
+
 def _sanitize_jsonl(raw: str, mode: str) -> str:
     """Filter tool_use / tool_result content from the raw transcript
     according to `log_tool_calls` mode.
@@ -810,15 +990,17 @@ def _sanitize_jsonl(raw: str, mode: str) -> str:
                               ExitPlanMode plans are always preserved.
         "minimal"           — keep tool name + correlation id, replace input
                               and output with a [STRIPPED] placeholder.
-        "full"              — pass through unchanged. Wider secrets surface;
+        "full"              — keep all tool content. Wider secrets surface;
                               gitleaks + expanded patterns become the backstop.
+
+    Bookkeeping entry types (_BOOKKEEPING_ENTRY_TYPES) are dropped in EVERY
+    mode — `log_tool_calls` governs tool content, and rewind checkpoints /
+    UI state aren't that. They're also the bulk of the bytes.
 
     This operates on the byte-level JSONL before `_redact` so we never run
     regex over tool content we've decided to drop anyway.
     """
-    if mode == "full":
-        return raw
-    if mode not in ("none", "minimal"):
+    if mode not in ("none", "minimal", "full"):
         mode = "none"  # safe default on typos
 
     out_lines: list[str] = []
@@ -833,11 +1015,15 @@ def _sanitize_jsonl(raw: str, mode: str) -> str:
             out_lines.append(line)  # pass through malformed
             continue
 
-        message = entry.get("message")
-        if isinstance(message, dict):
-            content = message.get("content")
-            if isinstance(content, list):
-                message["content"] = _filter_content_blocks(content, mode)
+        if entry.get("type") in _BOOKKEEPING_ENTRY_TYPES:
+            continue
+
+        if mode != "full":
+            message = entry.get("message")
+            if isinstance(message, dict):
+                content = message.get("content")
+                if isinstance(content, list):
+                    message["content"] = _filter_content_blocks(content, mode)
 
         # Preserve original line ending style
         newline = "\n" if line.endswith("\n") else ""

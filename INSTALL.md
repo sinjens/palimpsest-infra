@@ -328,7 +328,7 @@ Keep brains **private** — they contain raw conversation data, even after redac
 
 - Every Claude Code session's prompts + responses land in the matching brain, date-sharded, redacted.
 - Unclassified sessions stage in `palimpsest-unclassified/` and auto-migrate on classification.
-- The `.jsonl` sidecar preserves full fidelity for the compile loop.
+- The `.jsonl` sidecars preserve transcript fidelity as per-day delta shards — concatenate a session's shards in date order to reconstruct the full sanitized transcript.
 
 ---
 

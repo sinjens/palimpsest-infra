@@ -44,7 +44,7 @@ Network failures never block the hook — they land in `~/.claude/palimpsest/err
 Two surfaces land on disk per turn (per brain):
 
 - **`.md`** — a condensed, human-readable narrative: your prompts, Claude's text responses, and ExitPlanMode plans. No tool content.
-- **`.jsonl`** — the richer transcript, governed by the `log_tool_calls` config setting.
+- **`.jsonl`** — the richer transcript, governed by the `log_tool_calls` config setting. Sharded as **per-day deltas**: each day's file carries only the lines the session gained that day (a `palimpsest-shard` marker line opens each file; concatenating a session's shards in date order reconstructs the whole transcript, restarting at any `kind: "full"` marker). Bookkeeping entry types Claude Code interleaves into its transcript (rewind file checkpoints, UI state) are dropped in every mode — they're not conversation, and the checkpoints alone can be the majority of the bytes.
 
 ### `log_tool_calls` modes
 
@@ -194,7 +194,7 @@ Inside each brain:
     └── logs/
         └── YYYY-MM-DD/
             ├── HHMMSS_<title>_<session_id>.md      ← human audit
-            └── HHMMSS_<title>_<session_id>.jsonl   ← full transcript
+            └── HHMMSS_<title>_<session_id>.jsonl   ← transcript shard (that day's delta)
 ```
 
 `HHMMSS` is the session's first-entry time for that date folder. `session_id` is the full UUID — stable join key across date folders if a session spans midnight.
