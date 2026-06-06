@@ -8,13 +8,18 @@ Routines shipped as a research preview in April 2026. The authoring surface is U
 
 ## What the routine does
 
-For each brain repo the contributor owns, the routine runs three things:
+The routine runs exactly ONE command: `python compile/nightly.py` (from any brain checkout — the runner discovers its siblings). The runner deterministically executes, per brain in fixed order (personal, work, both):
 
-1. `python compile/main.py` — Sonnet synthesis: reads the day's raw logs, updates curated articles.
-2. `python compile/supervise.py` — Opus review: consolidates, reconciles contradictions, flags `share: true`.
-3. `python compile/promote.py` (from `palimpsest-work` only, with `PALIMPSEST_BOTH_BRAIN` set) — copies `share: true` articles from `palimpsest-work` and `palimpsest-both` into the shared company brain.
+1. `git pull --rebase --autostash` — a brain that can't sync is skipped, never compiled stale.
+2. `python compile/main.py` — Sonnet synthesis: reads the day's raw logs, updates curated articles.
+3. `python compile/supervise.py` — Opus review: consolidates, reconciles contradictions, flags `share: true`.
+4. Writes + commits a run receipt (`compile/last-run.json`: per-step exit codes and durations), then pushes.
 
-Each script commits + pushes on its own. The cursor file (`compile/cursor.txt`) makes runs idempotent — re-running on the same day is a no-op.
+Then once: `python compile/promote.py` (from `palimpsest-work`, with `PALIMPSEST_BOTH_BRAIN`/`PALIMPSEST_WORK_SHARED` set by the runner) — copies `share: true` articles into the shared company brain and pushes it.
+
+The cursor file (`compile/cursor.txt`) makes runs idempotent — re-running on the same day is a no-op. The receipt makes completion auditable from any checkout: if `compile/last-run.json` on origin doesn't carry last night's date with all-zero exit codes, the run did not fully happen.
+
+**Why a runner script instead of prompt steps:** on 2026-06-06 the executing agent parallelized the per-brain steps as background tasks (despite explicit ordering in the prompt); one task never completed and a brain was silently skipped. Orchestration is now code; the agent only launches it and relays the report.
 
 ## Container environment (verified as of 2026-04-20)
 
@@ -98,57 +103,32 @@ Copy everything between the `*** PROMPT STARTS HERE ***` and `*** PROMPT ENDS HE
 
 *** PROMPT STARTS HERE ***
 
-You are the Palimpsest nightly compile runner.
+You are the Palimpsest nightly compile runner. Your entire job is to launch ONE script in the foreground and relay its report. All orchestration lives in the script.
 
-**Step 1 — discover brain checkouts.**
-
-The cloud-container init cloned four repos somewhere on disk. Find them:
+**Step 1 — locate the work-brain checkout.**
 
 ```bash
-for slug in palimpsest-personal palimpsest-work palimpsest-both palimpsest-work-shared; do
-  path=$(find / -maxdepth 6 -type d -name "$slug" 2>/dev/null | head -1)
-  echo "$slug=$path"
-done
+WORK=$(find / -maxdepth 6 -type d -name "palimpsest-work" 2>/dev/null | head -1)
+echo "WORK=$WORK"
 ```
 
-Export the four discovered paths as `PERSONAL`, `WORK`, `BOTH`, `SHARED`. If any are empty, abort and report which are missing — do not fabricate.
+If empty, abort and report that the checkout is missing — do not fabricate paths.
 
-**Step 2 — pull each brain, pin to main.**
-
-For each of `$PERSONAL`, `$WORK`, `$BOTH`, `$SHARED`:
+**Step 2 — run the pipeline, foreground, single command.**
 
 ```bash
-cd $<BRAIN>
-git checkout main
-git pull --rebase --autostash origin main
+cd "$WORK" && git checkout main && python compile/nightly.py
 ```
 
-All commits and pushes throughout this run must land on `main`. Do not create `claude/*` branches. If you see any step attempt to open a PR or push to a non-main branch, stop and report it.
+Hard rules:
 
-**Step 3 — synthesis + supervisor per brain.**
+- Run it as one FOREGROUND command and wait for it to finish. NEVER move it to a background task, never parallelize anything, and never end your turn while it is still running. It can take up to ~60 minutes on a backfill night — that is normal; wait.
+- Do NOT run `compile/main.py`, `compile/supervise.py`, or `compile/promote.py` yourself — the runner sequences them.
+- Do NOT commit, push, retry failed steps, or edit brain content yourself. The runner commits receipts and pushes; commits must land on `main` (no `claude/*` branches — if you see one being created, stop and report it).
 
-For each brain in that order (personal, work, both):
+**Step 3 — report.**
 
-1. `cd $<BRAIN>`
-2. `python compile/main.py`
-3. `python compile/supervise.py`
-
-Each script commits + pushes on its own. If either exits non-zero, capture the last 50 lines of its stderr, continue to the next brain — don't abort the whole run.
-
-**Step 4 — promote to shared.**
-
-```bash
-cd $WORK
-PALIMPSEST_BOTH_BRAIN="$BOTH" \
-  PALIMPSEST_WORK_SHARED="$SHARED" \
-  python compile/promote.py
-```
-
-**Step 5 — report.**
-
-Summarise per brain: rows compiled, articles created/updated/deleted, commit SHA pushed (or "no changes"). For any non-zero exit, include the stderr tail. One line per brain if everything succeeded.
-
-**Do not**: retry failed scripts, edit brain content directly, or touch `palimpsest/index.md` or `palimpsest/CHANGELOG.md` (the scripts regenerate those).
+Relay the runner's final `NIGHTLY REPORT` block verbatim. If its exit code was non-zero, also include the last 50 lines of output preceding the report.
 
 *** PROMPT ENDS HERE ***
 
@@ -203,3 +183,4 @@ If none of those apply, a local Scheduled Task (Windows) or launchd/cron job (ma
 
 - **2026-04-20**: First real routine run. Confirmed `claude`/`python`/`git` preinstalled, `gitleaks` missing. Confirmed two-phase init (cloud-container clone then setup script). Replaced speculative `/workspace/` mount paths with prompt-time discovery. Pinned gitleaks 8.30.1 in setup script.
 - **2026-04-20**: Second real routine run. All four pushes landed on `claude/*` branches, not `main`, because the default-on branch-prefix guardrail rewrote them. Supervisor edits on personal + both were genuinely useful and merged back manually. Added explicit main-only instruction to prompt and reframed the guardrail section as "disable before first run, with recovery recipe if you forgot".
+- **2026-06-06**: The 01:05 run parallelized the per-brain steps as background tasks despite the prompt's explicit ordering; the both-brain task never completed and the brain was silently skipped (caught next morning, recovered by a local run). Orchestration moved from prompt prose into `compile/nightly.py` — deterministic sequence, per-step timeouts, explicit pushes, committed `compile/last-run.json` receipts per brain. Prompt reduced to: locate checkout, run the script in the foreground, relay its report.
