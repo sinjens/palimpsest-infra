@@ -94,6 +94,11 @@ MAX_INLINE_ARTICLES = 25
 # Cap on how many articles the targeting stage may select for inlining.
 MAX_TARGET_ARTICLES = 10
 
+# Sessions whose whole .md file is smaller than this are auto-skipped
+# without any model call — at this size the file is a header plus a
+# sentence or two and never yields durable knowledge. Set to 0 to disable.
+SKIP_GATE_BYTES = max(0, int(os.environ.get("PALIMPSEST_MIN_SESSION_BYTES", "1000") or "1000"))
+
 # Stage-1 prompt. Scope-agnostic (routing needs no scope rules), so it
 # lives here rather than in prompts/ — one less file to keep in sync
 # across brains.
@@ -769,6 +774,23 @@ def main() -> int:
             print(f"  Compiling: {session.name}")
             if args.dry_run:
                 print("    (dry-run; skipping claude invocation)")
+                continue
+            try:
+                session_bytes = session.stat().st_size
+            except OSError:
+                session_bytes = SKIP_GATE_BYTES  # unreadable -> don't gate
+            if session_bytes < SKIP_GATE_BYTES:
+                reason = f"auto: trivial session ({session_bytes} bytes < {SKIP_GATE_BYTES})"
+                print(f"    skip    {reason}")
+                run_record = {
+                    "time": datetime.now().strftime("%H:%M"),
+                    "edits": [("skip", reason)],
+                    "summary": "",
+                }
+                update_changelog(d, [run_record])
+                write_cursor(d, session.name)
+                if not args.no_commit:
+                    git_commit_changes([])
                 continue
             try:
                 response = compile_session(session, prompt_template)

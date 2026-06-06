@@ -1,9 +1,24 @@
-"""Palimpsest supervisor — library-level coherence pass.
+"""Palimpsest supervisor — incremental library-coherence pass.
 
-Reads the full current palimpsest/ (all articles, the index), feeds to
-Opus, applies the returned edit set (rewrite / delete). No human review
-gate — raw logs are immutable, so if the supervisor goes wrong we can
-always re-derive from source.
+Reviews, in full text, only the articles that need eyes tonight:
+
+    dirty set    — changed since the last supervisor pass (git diff against
+                   the SHA in compile/supervise-state.txt)
+    neighbours   — `related:` links of dirty articles
+    flags        — python pre-checks: TTL expiry (all articles, free date
+                   math) and an email-pattern GDPR screen (dirty only)
+    audit shard  — a rotating 1/N of the library (path-hash mod
+                   PALIMPSEST_AUDIT_SHARDS vs day-of-epoch), so every
+                   article gets a deep review every N nights regardless
+                   of activity. 0 disables the rotation.
+
+The full TOC rides along for awareness, but the model may only rewrite or
+delete articles shown in full — edits to unshown articles are dropped
+(the same blind-update-guard philosophy as synthesis). Earlier this read
+the ENTIRE library every night (~280k tokens at 361 articles) to usually
+conclude "no changes"; now a typical night is the audit shard plus a
+handful of dirty articles. No human review gate — raw logs are immutable,
+so if the supervisor goes wrong we can always re-derive from source.
 
 Usage:
     python compile/supervise.py                  # run supervisor pass, commit locally
@@ -11,11 +26,12 @@ Usage:
     python compile/supervise.py --no-commit      # apply edits, skip git commit
 """
 import argparse
+import hashlib
 import os
 import re
 import subprocess
 import sys
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 # Force UTF-8 on stdout/stderr so Sonnet responses containing non-ASCII
@@ -66,10 +82,24 @@ CHANGELOG_FILE = compile_main.CHANGELOG_FILE
 INDEX_FILE = compile_main.INDEX_FILE
 
 SUPERVISE_PROMPT_FILE = COMPILE_DIR / "prompts" / "supervise.md"
+# Last-reviewed commit SHA; the dirty set is everything under palimpsest/
+# changed after it. Committed alongside the supervisor's edits so every
+# checkout (and the routine container) shares the same review frontier.
+STATE_FILE = COMPILE_DIR / "supervise-state.txt"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 SUPERVISOR_MODEL = os.environ.get("PALIMPSEST_SUPERVISOR_MODEL", "opus")
 CLAUDE_TIMEOUT_SECONDS = 600  # supervisor gets more slack than synthesis
+
+# Rotating audit width: every article gets a full-text review once per
+# AUDIT_SHARDS nights, dirty or not. 0 disables the rotation.
+AUDIT_SHARDS = max(0, int(os.environ.get("PALIMPSEST_AUDIT_SHARDS", "7") or "7"))
+
+_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+_TTL_RE = re.compile(r"^ttl:\s*(\S+)", re.MULTILINE)
+_UPDATED_RE = re.compile(r"^updated:\s*(\d{4}-\d{2}-\d{2})", re.MULTILINE)
+_RELATED_RE = re.compile(r"^related:\s*\[(.*?)\]", re.MULTILINE)
+_TTL_DAYS = {"2w": 14, "3mo": 90, "1y": 365}  # `stable` never expires
 
 
 def list_articles() -> list[Path]:
@@ -200,7 +230,9 @@ def parse_supervise_response(text: str) -> dict:
     return {"edits": edits, "session_summary": summary}
 
 
-def apply_supervise_edits(response: dict) -> list[tuple[str, str]]:
+def apply_supervise_edits(
+    response: dict, allowed_rels: set[str] | None = None
+) -> list[tuple[str, str]]:
     applied: list[tuple[str, str]] = []
     for edit in response.get("edits", []):
         action = edit.get("action", "")
@@ -210,6 +242,21 @@ def apply_supervise_edits(response: dict) -> list[tuple[str, str]]:
             continue
         if not path_str.startswith("palimpsest/"):
             print(f"warning: path outside palimpsest/, ignoring: {path_str!r}", file=sys.stderr)
+            continue
+        # Blind-edit guard: rewriting or deleting an EXISTING article the
+        # model only saw as a TOC line would destroy content it never read.
+        # (Creating a genuinely new path is fine.)
+        if (
+            allowed_rels is not None
+            and path_str not in allowed_rels
+            and (BRAIN_ROOT / path_str).exists()
+        ):
+            print(
+                f"warning: dropping {action} of unshown article {path_str} "
+                "(not in tonight's review set)",
+                file=sys.stderr,
+            )
+            applied.append(("skip", f"blind-edit guard: dropped {action} of unshown {path_str}"))
             continue
         target = BRAIN_ROOT / path_str
         if action == "delete":
@@ -232,28 +279,145 @@ def apply_supervise_edits(response: dict) -> list[tuple[str, str]]:
     return applied
 
 
-def build_supervisor_context() -> str:
-    articles = list_articles()
-    toc = compile_main.build_toc()
+def head_sha() -> str | None:
+    r = subprocess.run(
+        ["git", "-C", str(BRAIN_ROOT), "rev-parse", "HEAD"],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip() if r.returncode == 0 else None
 
-    today = date.today().isoformat()
 
-    if not articles:
-        return f"# Palimpsest library state — {today}\n\n(empty — no articles yet)\n"
+def read_state() -> str | None:
+    try:
+        lines = STATE_FILE.read_text(encoding="utf-8").strip().splitlines()
+        return lines[0].strip() or None
+    except (OSError, IndexError):
+        return None
 
+
+def dirty_articles(since_sha: str, articles: list[Path]) -> list[Path]:
+    """Articles changed since the last reviewed SHA. An unknown SHA
+    (rewritten history) degrades to reviewing everything once."""
+    r = subprocess.run(
+        ["git", "-C", str(BRAIN_ROOT), "diff", "--name-only",
+         f"{since_sha}..HEAD", "--", "palimpsest/"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        print(f"warning: diff against state SHA failed; reviewing full library once",
+              file=sys.stderr)
+        return list(articles)
+    by_rel = {a.relative_to(BRAIN_ROOT).as_posix(): a for a in articles}
+    return [by_rel[p] for p in r.stdout.splitlines() if p in by_rel]
+
+
+def related_neighbors(seeds: list[Path], articles: list[Path]) -> list[Path]:
+    """Articles whose slug appears in a seed's `related:` frontmatter list."""
+    by_stem = {a.stem: a for a in articles}
+    out: list[Path] = []
+    for seed in seeds:
+        try:
+            m = _RELATED_RE.search(seed.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        if not m:
+            continue
+        for slug in m.group(1).split(","):
+            slug = slug.strip().strip("'\"")
+            if slug and slug in by_stem and by_stem[slug] not in seeds:
+                out.append(by_stem[slug])
+    return out
+
+
+def ttl_expired(text: str, today: date) -> bool:
+    ttl_m, upd_m = _TTL_RE.search(text), _UPDATED_RE.search(text)
+    if not ttl_m or not upd_m:
+        return False
+    days = _TTL_DAYS.get(ttl_m.group(1).strip())
+    if days is None:
+        return False  # `stable` or unknown — never auto-expires
+    try:
+        return date.fromisoformat(upd_m.group(1)) + timedelta(days=days) < today
+    except ValueError:
+        return False
+
+
+def audit_shard(articles: list[Path], today: date) -> list[Path]:
+    """Tonight's rotating slice: stable path-hash mod N == day-of-epoch mod N."""
+    if AUDIT_SHARDS <= 0:
+        return []
+    slot = today.toordinal() % AUDIT_SHARDS
+    return [
+        a for a in articles
+        if int(hashlib.sha1(
+            a.relative_to(BRAIN_ROOT).as_posix().encode()
+        ).hexdigest()[:8], 16) % AUDIT_SHARDS == slot
+    ]
+
+
+def select_review_set(articles: list[Path], today: date) -> dict[Path, set[str]]:
+    """The articles shown in full tonight, each mapped to its review reasons."""
+    shown: dict[Path, set[str]] = {}
+
+    def add(paths: list[Path], reason: str) -> None:
+        for p in paths:
+            shown.setdefault(p, set()).add(reason)
+
+    state = read_state()
+    dirty: list[Path] = []
+    if state:
+        dirty = dirty_articles(state, articles)
+    else:
+        print("No supervise state yet — bootstrapping incremental review "
+              "(the audit rotation covers the backlog).")
+    add(dirty, "changed since last review")
+    add(related_neighbors(dirty, articles), "related to a changed article")
+
+    for a in articles:
+        try:
+            text = a.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        if ttl_expired(text, today):
+            add([a], "ttl expired")
+    for a in dirty:
+        try:
+            if _EMAIL_RE.search(a.read_text(encoding="utf-8")):
+                add([a], "automated GDPR screen: contains an email-like string")
+        except OSError:
+            pass
+
+    add(audit_shard(articles, today), "scheduled audit shard")
+    return shown
+
+
+def build_review_context(
+    shown: dict[Path, set[str]], toc: str, total: int, today: date
+) -> str:
     parts = [
-        f"# Palimpsest library state — {today}",
+        f"# Palimpsest review scope — {today.isoformat()}",
         "",
-        "## Index (TOC)",
+        f"This is an INCREMENTAL review: {len(shown)} of {total} articles are "
+        "shown in full below — those changed since the last supervisor pass, "
+        "their `related:` neighbours, automated-check flags, and tonight's "
+        "rotating audit shard. Each carries its review reason. The full index "
+        "(TOC) is provided for awareness, but you may ONLY rewrite or delete "
+        "articles shown in full — the pipeline drops edits aimed at unshown "
+        "articles. If a shown article duplicates or contradicts an UNSHOWN "
+        "one (per the TOC), describe that in the summary so a later pass "
+        "picks it up; do not rewrite the unshown side.",
+        "",
+        "## Index (TOC, all articles)",
         "",
         toc,
         "",
-        "## Articles (full text)",
+        "## Articles under review (full text)",
         "",
     ]
-    for a in articles:
+    for a, reasons in shown.items():
         rel = a.relative_to(BRAIN_ROOT).as_posix()
         parts.append(f"### {rel}")
+        parts.append(f"_review reason: {'; '.join(sorted(reasons))}_")
         parts.append("")
         parts.append(a.read_text(encoding="utf-8").rstrip())
         parts.append("")
@@ -320,7 +484,8 @@ def update_supervise_changelog(edits: list[tuple[str, str]], summary: str) -> No
 
 def git_commit_supervise(summary: str) -> bool:
     subprocess.run(
-        ["git", "-C", str(BRAIN_ROOT), "add", "palimpsest"],
+        ["git", "-C", str(BRAIN_ROOT), "add", "palimpsest",
+         "compile/supervise-state.txt"],
         check=True,
     )
     diff = subprocess.run(
@@ -350,14 +515,40 @@ def main() -> int:
         print("No articles to review — skipping supervisor pass.")
         return 0
 
-    print(f"Supervisor pass: {len(articles)} article(s) in scope, model={SUPERVISOR_MODEL}")
+    today = date.today()
+    # Capture the frontier BEFORE the model runs: anything committed while
+    # the review is in flight lands after this SHA and gets reviewed next
+    # night instead of slipping through the gap.
+    head = head_sha()
 
-    context = build_supervisor_context()
+    shown = select_review_set(articles, today)
+    if not shown:
+        print("Nothing to review tonight (no changes since last pass, no "
+              "flags, audit rotation disabled) — skipping the model call.")
+        return 0
+
+    reason_counts: dict[str, int] = {}
+    for reasons in shown.values():
+        for r in reasons:
+            key = r.split(":")[0]
+            reason_counts[key] = reason_counts.get(key, 0) + 1
+    print(
+        f"Supervisor pass: {len(shown)}/{len(articles)} article(s) in scope "
+        f"({', '.join(f'{k}={v}' for k, v in sorted(reason_counts.items()))}), "
+        f"model={SUPERVISOR_MODEL}"
+    )
+
+    toc = compile_main.build_toc()
+    context = build_review_context(shown, toc, len(articles), today)
     full_prompt = prompt_template + "\n\n---\n\n" + context
+    shown_rels = {a.relative_to(BRAIN_ROOT).as_posix() for a in shown}
 
     if args.dry_run:
         print("(dry-run: not invoking claude; context would be "
               f"~{len(full_prompt)//4} tokens)")
+        for a, reasons in shown.items():
+            print(f"  would review {a.relative_to(BRAIN_ROOT).as_posix()}"
+                  f"  [{'; '.join(sorted(reasons))}]")
         return 0
 
     try:
@@ -389,12 +580,18 @@ def main() -> int:
     summary = (response.get("session_summary") or "").strip()
     print(f"Supervisor summary: {summary[:200]}")
 
-    applied = apply_supervise_edits(response)
+    applied = apply_supervise_edits(response, shown_rels)
     for action, identifier in applied:
         print(f"  {action:<7}  {identifier}")
 
     update_supervise_changelog(applied, summary)
     compile_main.regenerate_index()
+
+    # Advance the review frontier to the pre-review HEAD. Edits the
+    # supervisor just made land after it and are deliberately re-eligible —
+    # cheap, and lets next night's pass sanity-check its own work.
+    if head:
+        STATE_FILE.write_text(head + "\n", encoding="utf-8")
 
     if args.no_commit:
         print("(--no-commit: staged changes not committed)")

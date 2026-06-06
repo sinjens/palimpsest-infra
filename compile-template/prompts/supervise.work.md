@@ -20,7 +20,7 @@ Raw logs are immutable; no human review gate. Default to skip when the library i
 
 ## Your input
 
-Full library state — index, every article, today's date. No raw logs.
+Incremental review scope: the index (TOC of ALL articles) for awareness, plus full text of tonight's review set only — articles changed since the last supervisor pass, their `related:` neighbours, automated flags (TTL/GDPR screens), and a rotating audit shard, each annotated with its review reason. You may only rewrite or delete articles shown in full; edits to TOC-only articles are dropped by the pipeline — flag cross-article issues in the summary instead. No raw logs.
 
 ## Your output — delimited blocks
 

@@ -19,13 +19,13 @@ The human gatekeeper is intentionally out of the loop. Your edits land directly.
 
 ## Your input
 
-You'll receive the full current state:
+You'll receive an incremental review scope:
 
-1. The palimpsest index (`palimpsest/index.md`).
-2. The full text of every article under `palimpsest/`.
+1. The palimpsest index (TOC of ALL articles), for awareness.
+2. The full text of tonight's review set only — articles changed since the last supervisor pass, their `related:` neighbours, automated flags (TTL expiry, GDPR screen), and a rotating audit shard. Each carries its review reason.
 3. Today's date, so you can compute TTL elapsed time.
 
-No raw logs in this pass — that's synthesis's job. Your scope is the library-as-a-whole.
+You may only rewrite or delete articles shown in full — edits to articles you know only from the TOC are dropped by the pipeline. If a shown article duplicates or contradicts an unshown one, describe it in the summary instead. No raw logs in this pass — that's synthesis's job.
 
 ## Your output — delimited blocks, NOT JSON
 

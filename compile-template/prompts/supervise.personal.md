@@ -15,7 +15,7 @@ Raw logs are immutable and there is no human gate — if you go wrong, we re-der
 
 ## Your input
 
-Full library state — index, every article, today's date. No raw logs (synthesis's job).
+Incremental review scope: the index (TOC of ALL articles) for awareness, plus full text of tonight's review set only — articles changed since the last supervisor pass, their `related:` neighbours, automated flags, and a rotating audit shard, each annotated with its review reason. You may only rewrite or delete articles shown in full; edits to TOC-only articles are dropped by the pipeline — flag cross-article issues in the summary instead. No raw logs (synthesis's job).
 
 ## Your output — delimited blocks
 
