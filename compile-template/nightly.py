@@ -145,6 +145,24 @@ def git(brain: Path, *args: str, timeout: int = GIT_TIMEOUT) -> subprocess.Compl
     )
 
 
+def ensure_on_main(brain: Path) -> subprocess.CompletedProcess:
+    """Hard-align the checkout to origin/main before doing anything else.
+
+    A container's persistent checkout can be left on a `claude/*` branch
+    (the Routines branch-prefix guardrail) or any non-main branch with no
+    upstream — which makes a bare `git pull` fail with "no tracking
+    information" and a `git push` fail with "no upstream branch". The
+    container is a compute node, never a source of truth: everything it
+    produces is committed and pushed within the same run, so resetting
+    local main to origin/main is safe — at worst a not-yet-pushed compile
+    is redone next run (the cursor stays behind to make that automatic).
+    """
+    fetch = git(brain, "fetch", "origin", "main")
+    if fetch.returncode != 0:
+        return fetch  # offline / bad remote — caller treats as sync failure
+    return git(brain, "checkout", "-B", "main", "origin/main")
+
+
 def push_with_retry(brain: Path) -> dict:
     """git push; on a non-fast-forward rejection, pull --rebase once and retry."""
     t0 = time.monotonic()
@@ -197,17 +215,23 @@ def process_brain(kind: str, brain: Path, dry_run: bool) -> dict:
     steps: dict[str, dict] = {}
     started = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    # Pull first; a brain we can't sync gets skipped entirely rather than
-    # compiled against a stale or diverged tree.
+    # Sync first: normalize onto origin/main (whatever branch a prior run
+    # left checked out), then pull. A brain we can't sync is skipped
+    # entirely rather than compiled against a stale or diverged tree.
     t0 = time.monotonic()
     try:
-        pull = git(brain, "pull", "--rebase", "--autostash")
-        steps["pull"] = {"rc": pull.returncode, "seconds": round(time.monotonic() - t0, 1)}
-        if pull.returncode != 0:
-            log(f"--- pull failed, skipping {kind}: {(pull.stderr or pull.stdout)[:300]}")
+        norm = ensure_on_main(brain)
+        if norm.returncode != 0:
+            steps["pull"] = {"rc": norm.returncode or 1, "seconds": round(time.monotonic() - t0, 1)}
+            log(f"--- sync failed, skipping {kind}: {(norm.stderr or norm.stdout)[:300]}")
+        else:
+            pull = git(brain, "pull", "--rebase", "--autostash")
+            steps["pull"] = {"rc": pull.returncode, "seconds": round(time.monotonic() - t0, 1)}
+            if pull.returncode != 0:
+                log(f"--- pull failed, skipping {kind}: {(pull.stderr or pull.stdout)[:300]}")
     except subprocess.TimeoutExpired:
         steps["pull"] = {"rc": -1, "seconds": round(time.monotonic() - t0, 1)}
-        log(f"--- pull timeout, skipping {kind}")
+        log(f"--- sync timeout, skipping {kind}")
 
     if steps["pull"]["rc"] == 0:
         dry = ["--dry-run"] if dry_run else []
@@ -254,7 +278,9 @@ def main() -> int:
         if kind in brains:
             results[kind] = process_brain(kind, brains[kind], args.dry_run)
 
-    # Promote: work -> shared. promote.py pushes the shared repo itself.
+    # Promote: work -> shared. promote.py pushes the shared repo itself, so
+    # the shared checkout must be on main with an upstream first (same
+    # claude/* / no-upstream hazard as the brains above).
     if "work" in brains and "shared" in brains and "both" in brains:
         env = {**os.environ,
                "PALIMPSEST_BOTH_BRAIN": str(brains["both"]),
@@ -262,13 +288,18 @@ def main() -> int:
         dry = ["--dry-run"] if args.dry_run else []
         log(f"--- promote: work -> shared  (timeout={PROMOTE_TIMEOUT}s)")
         t0 = time.monotonic()
-        try:
-            rc = subprocess.run(
-                [sys.executable, "compile/promote.py", *dry],
-                cwd=str(brains["work"]), env=env, timeout=PROMOTE_TIMEOUT,
-            ).returncode
-        except (subprocess.TimeoutExpired, OSError):
-            rc = -1
+        norm = ensure_on_main(brains["shared"])
+        if norm.returncode != 0 and not args.dry_run:
+            log(f"--- promote: shared sync failed: {(norm.stderr or norm.stdout)[:300]}")
+            rc = norm.returncode or 1
+        else:
+            try:
+                rc = subprocess.run(
+                    [sys.executable, "compile/promote.py", *dry],
+                    cwd=str(brains["work"]), env=env, timeout=PROMOTE_TIMEOUT,
+                ).returncode
+            except (subprocess.TimeoutExpired, OSError):
+                rc = -1
         results["promote"] = {"promote": {"rc": rc, "seconds": round(time.monotonic() - t0, 1)}}
         log(f"--- promote: rc={rc}")
     else:
