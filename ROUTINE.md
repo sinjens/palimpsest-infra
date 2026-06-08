@@ -117,8 +117,10 @@ If empty, abort and report that the checkout is missing — do not fabricate pat
 **Step 2 — run the pipeline, foreground, single command.**
 
 ```bash
-cd "$WORK" && git checkout main && python compile/nightly.py
+cd "$WORK" && git checkout main && git pull --rebase --autostash && python compile/nightly.py
 ```
+
+The `git pull` here is load-bearing: the container's checkout can be stale (a persistent or cached clone from before the runner landed), and `compile/nightly.py` can't pull itself into existence. Without this pull, a stale checkout aborts with "nightly.py not found" even though the runner is on `origin/main`. The runner then pulls each individual brain itself.
 
 Hard rules:
 
@@ -184,4 +186,5 @@ If none of those apply, a local Scheduled Task (Windows) or launchd/cron job (ma
 - **2026-04-20**: First real routine run. Confirmed `claude`/`python`/`git` preinstalled, `gitleaks` missing. Confirmed two-phase init (cloud-container clone then setup script). Replaced speculative `/workspace/` mount paths with prompt-time discovery. Pinned gitleaks 8.30.1 in setup script.
 - **2026-04-20**: Second real routine run. All four pushes landed on `claude/*` branches, not `main`, because the default-on branch-prefix guardrail rewrote them. Supervisor edits on personal + both were genuinely useful and merged back manually. Added explicit main-only instruction to prompt and reframed the guardrail section as "disable before first run, with recovery recipe if you forgot".
 - **2026-06-06**: The 01:05 run parallelized the per-brain steps as background tasks despite the prompt's explicit ordering; the both-brain task never completed and the brain was silently skipped (caught next morning, recovered by a local run). Orchestration moved from prompt prose into `compile/nightly.py` — deterministic sequence, per-step timeouts, explicit pushes, committed `compile/last-run.json` receipts per brain. Prompt reduced to: locate checkout, run the script in the foreground, relay its report.
+- **2026-06-07**: First scheduled run on the new prompt aborted — `compile/nightly.py not found`. The runner was on `origin/main`, but the container's checkout was stale and the prompt's launch step did `git checkout main` with no `git pull`, so it never fast-forwarded to the commit containing the runner (which can't pull itself into existence). The runner correctly refused to fabricate and aborted clean (no commits). Fix: added `git pull --rebase --autostash` to the launch line. No data lost — cursors made the next run a catch-up.
 - **2026-06-06** (v0.7.0): Supervise went incremental. The full-library nightly read (~280k tokens at 361 articles, 70% no-op verdicts historically) is replaced by: dirty set since the last reviewed SHA (`compile/supervise-state.txt`, committed) + `related:` neighbours + python pre-checks (TTL expiry, GDPR email screen on dirty) + a rotating 1/`PALIMPSEST_AUDIT_SHARDS` audit shard (default 7 — full coverage weekly). Quiet nights skip the model call entirely. The supervisor may only edit articles shown in full (blind-edit guard). Synthesis gained a trivial-session skip-gate (`PALIMPSEST_MIN_SESSION_BYTES`, default 1000). Measured: bootstrap night 59/361 articles ≈ 61k tokens.
