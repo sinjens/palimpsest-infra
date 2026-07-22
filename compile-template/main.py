@@ -78,10 +78,20 @@ PALIMPSEST_DIR = BRAIN_ROOT / "palimpsest"
 LOGS_DIR = BRAIN_ROOT / "raw" / "logs"
 INDEX_FILE = PALIMPSEST_DIR / "index.md"
 CHANGELOG_FILE = PALIMPSEST_DIR / "CHANGELOG.md"
+# Durable record of sessions the run could not compile (synthesis failed, or
+# over the size ceiling). Committed, so a skipped session is auditable and
+# re-runnable (`main.py --date <d> --session <id>`) — never silently lost.
+FAILED_SESSIONS_LOG = COMPILE_DIR / "failed-sessions.log"
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 MODEL = os.environ.get("PALIMPSEST_MODEL", "sonnet")
-CLAUDE_TIMEOUT_SECONDS = 600
+CLAUDE_TIMEOUT_SECONDS = max(60, int(os.environ.get("PALIMPSEST_CLAUDE_TIMEOUT", "600") or "600"))
+# Optional pre-emptive ceiling: skip (and record) a session whose .md exceeds
+# this many bytes without even attempting synthesis, so a pathologically large
+# session can't burn the run's whole time budget failing. 0 = disabled (rely
+# on skip-on-failure instead). Set when a chronic offender shows up in
+# failed-sessions.log.
+MAX_SESSION_BYTES = max(0, int(os.environ.get("PALIMPSEST_MAX_SESSION_BYTES", "0") or "0"))
 
 # Generous cap — articles we include verbatim in the prompt. Beyond this the
 # library is too big to inline wholesale and synthesis becomes two-stage:
@@ -466,6 +476,15 @@ def _save_last_response(text: str) -> Path:
     return dbg
 
 
+def _record_failed_session(d: date, session_name: str, reason: str) -> None:
+    """Append a skipped/failed session to the committed failed-sessions log."""
+    try:
+        with FAILED_SESSIONS_LOG.open("a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M}\t{d.isoformat()}\t{session_name}\t{reason}\n")
+    except OSError:
+        pass  # best-effort; the changelog skip entry is the other record
+
+
 # ----- compilation core ------------------------------------------------------
 
 
@@ -692,9 +711,11 @@ def git_commit_changes(session_summaries: list[str]) -> bool:
     True if a commit was made. Does not push."""
     # Stage only our own output paths so unrelated uncommitted changes in the
     # brain aren't swept up accidentally.
+    add_paths = ["palimpsest", "compile/cursor.txt"]
+    if FAILED_SESSIONS_LOG.exists():  # only present after a skip; add errors on a missing path
+        add_paths.append("compile/failed-sessions.log")
     subprocess.run(
-        ["git", "-C", str(BRAIN_ROOT), "add",
-         "palimpsest", "compile/cursor.txt"],
+        ["git", "-C", str(BRAIN_ROOT), "add", *add_paths],
         check=True,
     )
     diff = subprocess.run(
@@ -749,7 +770,7 @@ def main() -> int:
     if resume_session:
         print(f"Resuming after {start}/{resume_session}")
 
-    fatal_error: tuple[date, str] | None = None
+    skipped_sessions: list[tuple[str, str]] = []  # (session_name, reason)
 
     for d in daterange(start, end):
         sessions = find_sessions_for_date(d)
@@ -792,15 +813,38 @@ def main() -> int:
                 if not args.no_commit:
                     git_commit_changes([])
                 continue
+            # Pre-emptive size ceiling (opt-in): don't spend the run's time
+            # budget attempting a session we expect to fail. Recorded + skipped.
+            if MAX_SESSION_BYTES and session_bytes > MAX_SESSION_BYTES:
+                reason = f"over size ceiling ({session_bytes} bytes > {MAX_SESSION_BYTES})"
+                print(f"    SKIP (recorded): {reason}", file=sys.stderr)
+                _record_failed_session(d, session.name, reason)
+                skipped_sessions.append((session.name, reason))
+                update_changelog(d, [{"time": datetime.now().strftime("%H:%M"),
+                                      "edits": [("skip", f"auto: {reason}")], "summary": ""}])
+                write_cursor(d, session.name)
+                if not args.no_commit:
+                    git_commit_changes([])
+                continue
             try:
                 response = compile_session(session, prompt_template)
             except Exception as e:
-                print(f"    ERROR: {e}", file=sys.stderr)
+                # NON-FATAL: one session must never wedge the whole run. Record
+                # it, advance the cursor past it, and continue to the next.
+                # The session is logged for manual re-compile, not lost.
                 dbg = COMPILE_DIR / ".last-response.txt"
+                reason = f"synthesis failed: {type(e).__name__}: {e}"[:300]
+                print(f"    SKIP (recorded): {reason}", file=sys.stderr)
                 if dbg.exists():
                     print(f"    raw response saved at: {dbg}", file=sys.stderr)
-                fatal_error = (d, session.name)
-                break
+                _record_failed_session(d, session.name, reason)
+                skipped_sessions.append((session.name, reason))
+                update_changelog(d, [{"time": datetime.now().strftime("%H:%M"),
+                                      "edits": [("skip", f"auto: {reason}")], "summary": ""}])
+                write_cursor(d, session.name)
+                if not args.no_commit:
+                    git_commit_changes([])
+                continue
 
             summary = (response.get("session_summary") or "").strip()
             print(f"    Summary: {summary[:160]}")
@@ -821,20 +865,21 @@ def main() -> int:
             if not args.no_commit:
                 git_commit_changes([summary] if summary else [])
 
-        if fatal_error:
-            break
-
     if args.dry_run:
         print("\n(dry-run: no index regen, no cursor advance, no commit)")
         return 0
 
-    if fatal_error:
-        d, sname = fatal_error
-        print(
-            f"\nStopped at {d}/{sname} due to an error. "
-            "Cursor preserves progress through last successful session — re-run to continue."
-        )
-        return 1
+    if skipped_sessions:
+        # The run COMPLETED the whole range — the cursor is current and the
+        # pipeline is unwedged (exit 0). Skipped sessions are surfaced here and
+        # in compile/failed-sessions.log for manual attention, not treated as a
+        # pipeline failure (which would train red-blindness on a chronic
+        # offender). Re-compile one with: main.py --date <d> --session <id>.
+        print(f"\nCompile range processed; {len(skipped_sessions)} session(s) SKIPPED "
+              f"(recorded in {FAILED_SESSIONS_LOG.name}):")
+        for name, reason in skipped_sessions:
+            print(f"  - {name}: {reason}")
+        return 0
 
     print("\nCompile range processed cleanly.")
     return 0

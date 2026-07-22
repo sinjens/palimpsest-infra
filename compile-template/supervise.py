@@ -91,9 +91,20 @@ CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 SUPERVISOR_MODEL = os.environ.get("PALIMPSEST_SUPERVISOR_MODEL", "opus")
 CLAUDE_TIMEOUT_SECONDS = 600  # supervisor gets more slack than synthesis
 
-# Rotating audit width: every article gets a full-text review once per
-# AUDIT_SHARDS nights, dirty or not. 0 disables the rotation.
-AUDIT_SHARDS = max(0, int(os.environ.get("PALIMPSEST_AUDIT_SHARDS", "7") or "7"))
+# Rotating audit: a fixed COUNT of articles per night, NOT a fraction of the
+# library. A fraction (the old 1/7) grew without bound as the library grew —
+# at 686 articles it was pulling 99 full-text articles every night, which
+# (stacked on an accumulating dirty backlog) blew the review past the model's
+# context window and stalled the work brain. A fixed window walks the whole
+# library in ceil(library / AUDIT_COUNT) nights at constant nightly cost. 0
+# disables the rotation.
+AUDIT_COUNT = max(0, int(os.environ.get("PALIMPSEST_AUDIT_COUNT", "30") or "30"))
+# Hard ceiling on the review set, estimated as bytes/4. THE key robustness
+# guard: no matter how big the library or the dirty backlog, the single Opus
+# call stays bounded. Dirty/flagged articles take priority; the audit fills
+# whatever budget remains. Kept well under a 200k context window to leave
+# room for the TOC, prompt, and output.
+REVIEW_TOKEN_BUDGET = max(20_000, int(os.environ.get("PALIMPSEST_REVIEW_TOKEN_BUDGET", "120000") or "120000"))
 
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 _TTL_RE = re.compile(r"^ttl:\s*(\S+)", re.MULTILINE)
@@ -342,26 +353,58 @@ def ttl_expired(text: str, today: date) -> bool:
         return False
 
 
-def audit_shard(articles: list[Path], today: date) -> list[Path]:
-    """Tonight's rotating slice: stable path-hash mod N == day-of-epoch mod N."""
-    if AUDIT_SHARDS <= 0:
+def audit_rotation(articles: list[Path], today: date) -> list[Path]:
+    """A deterministic rotating window of AUDIT_COUNT articles. The window
+    advances by AUDIT_COUNT each day over a stable hash-ordering, so it walks
+    the whole library in ceil(n / AUDIT_COUNT) nights with no gaps — a fixed
+    nightly cost that does NOT scale with library size."""
+    if AUDIT_COUNT <= 0 or not articles:
         return []
-    slot = today.toordinal() % AUDIT_SHARDS
-    return [
-        a for a in articles
-        if int(hashlib.sha1(
-            a.relative_to(BRAIN_ROOT).as_posix().encode()
-        ).hexdigest()[:8], 16) % AUDIT_SHARDS == slot
-    ]
+    ordered = sorted(
+        articles,
+        key=lambda a: hashlib.sha1(a.relative_to(BRAIN_ROOT).as_posix().encode()).hexdigest(),
+    )
+    n = len(ordered)
+    start = (today.toordinal() * AUDIT_COUNT) % n
+    return [ordered[(start + i) % n] for i in range(min(AUDIT_COUNT, n))]
 
 
-def select_review_set(articles: list[Path], today: date) -> dict[Path, set[str]]:
-    """The articles shown in full tonight, each mapped to its review reasons."""
+def _est_tokens(path: Path) -> int:
+    try:
+        return max(1, path.stat().st_size // 4)
+    except OSError:
+        return 1
+
+
+def select_review_set(articles: list[Path], today: date) -> tuple[dict[Path, set[str]], dict]:
+    """Assemble tonight's review set under REVIEW_TOKEN_BUDGET, in priority
+    order so the single Opus call is always bounded:
+
+        1. automated flags — GDPR (email-like strings) + TTL expiry
+        2. changed-since-last-review (the dirty set)
+        3. `related:` neighbours of dirty articles
+        4. rotating audit window — fills whatever budget remains
+
+    Insertion stops adding a tier's articles once the budget is hit; anything
+    that didn't fit is DEFERRED, not lost — the frontier still advances (see
+    main), so deferred dirty articles get their coherence pass on their audit
+    night instead. On a normal night the whole dirty set fits and nothing is
+    deferred; deferral only kicks in during a backlog/spike, which is exactly
+    when an unbounded review would otherwise stall. Returns (shown, stats)."""
     shown: dict[Path, set[str]] = {}
+    used = 0
 
-    def add(paths: list[Path], reason: str) -> None:
-        for p in paths:
-            shown.setdefault(p, set()).add(reason)
+    def add(p: Path, reason: str) -> bool:
+        nonlocal used
+        if p in shown:
+            shown[p].add(reason)
+            return True
+        cost = _est_tokens(p)
+        if shown and used + cost > REVIEW_TOKEN_BUDGET:
+            return False  # over budget — defer to a later night / the audit
+        shown[p] = {reason}
+        used += cost
+        return True
 
     state = read_state()
     dirty: list[Path] = []
@@ -370,25 +413,40 @@ def select_review_set(articles: list[Path], today: date) -> dict[Path, set[str]]
     else:
         print("No supervise state yet — bootstrapping incremental review "
               "(the audit rotation covers the backlog).")
-    add(dirty, "changed since last review")
-    add(related_neighbors(dirty, articles), "related to a changed article")
 
+    # 1. flags first — cheap and important (compliance / freshness)
     for a in articles:
         try:
             text = a.read_text(encoding="utf-8")
         except OSError:
             continue
         if ttl_expired(text, today):
-            add([a], "ttl expired")
+            add(a, "ttl expired")
     for a in dirty:
         try:
             if _EMAIL_RE.search(a.read_text(encoding="utf-8")):
-                add([a], "automated GDPR screen: contains an email-like string")
+                add(a, "automated GDPR screen: contains an email-like string")
         except OSError:
             pass
+    # 2. dirty set (oldest change first — git diff order); count deferrals
+    deferred = 0
+    for a in dirty:
+        if not add(a, "changed since last review"):
+            deferred += 1
+    # 3. related neighbours of dirty
+    for a in related_neighbors(dirty, articles):
+        add(a, "related to a changed article")
+    # 4. audit fills the remaining budget
+    for a in audit_rotation(articles, today):
+        add(a, "scheduled audit shard")
 
-    add(audit_shard(articles, today), "scheduled audit shard")
-    return shown
+    stats = {
+        "total_articles": len(articles),
+        "dirty_total": len(dirty),
+        "deferred": deferred,
+        "est_tokens": used,
+    }
+    return shown, stats
 
 
 def build_review_context(
@@ -521,7 +579,7 @@ def main() -> int:
     # night instead of slipping through the gap.
     head = head_sha()
 
-    shown = select_review_set(articles, today)
+    shown, stats = select_review_set(articles, today)
     if not shown:
         print("Nothing to review tonight (no changes since last pass, no "
               "flags, audit rotation disabled) — skipping the model call.")
@@ -534,9 +592,17 @@ def main() -> int:
             reason_counts[key] = reason_counts.get(key, 0) + 1
     print(
         f"Supervisor pass: {len(shown)}/{len(articles)} article(s) in scope "
-        f"({', '.join(f'{k}={v}' for k, v in sorted(reason_counts.items()))}), "
+        f"(~{stats['est_tokens']//1000}k tok, budget {REVIEW_TOKEN_BUDGET//1000}k; "
+        f"{', '.join(f'{k}={v}' for k, v in sorted(reason_counts.items()))}), "
         f"model={SUPERVISOR_MODEL}"
     )
+    if stats["deferred"]:
+        print(
+            f"  note: {stats['deferred']} of {stats['dirty_total']} changed "
+            "article(s) exceeded the budget and were deferred to their audit "
+            "rotation (the frontier still advances, so the backlog drains "
+            "instead of spiralling)."
+        )
 
     toc = compile_main.build_toc()
     context = build_review_context(shown, toc, len(articles), today)
