@@ -231,7 +231,9 @@ def regenerate_shared_index() -> None:
                 ttl = m.group(1).strip() if m else "?"
                 m = re.search(r"^updated:\s*(\S+)", content, re.MULTILINE)
                 updated = m.group(1).strip() if m else "?"
-                lines.append(f"- [{title}]({rel}) — ttl:{ttl}, updated:{updated}")
+                # Escape []'s in the title or they break the Markdown link.
+                safe_title = title.replace("[", "\\[").replace("]", "\\]")
+                lines.append(f"- [{safe_title}]({rel}) — ttl:{ttl}, updated:{updated}")
             lines.append("")
     (SHARED_PAL / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 

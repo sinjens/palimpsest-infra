@@ -196,6 +196,13 @@ def _frontmatter_field(text: str, field: str) -> str | None:
     return m.group(1).strip() if m else None
 
 
+def _md_link_text(title: str) -> str:
+    """Backslash-escape square brackets in Markdown link text. Titles like
+    `[Authorize(Policy=...)]` otherwise close the `[...]` early and the whole
+    entry renders as plain, non-clickable text instead of a link."""
+    return title.replace("[", "\\[").replace("]", "\\]")
+
+
 def build_toc() -> str:
     articles = list_existing_articles()
     if not articles:
@@ -319,7 +326,7 @@ def regenerate_index() -> None:
                 title = _frontmatter_field(content, "title") or a.stem
                 ttl = _frontmatter_field(content, "ttl") or "?"
                 updated = _frontmatter_field(content, "updated") or "?"
-                lines.append(f"- [{title}]({rel}) — ttl:{ttl}, updated:{updated}")
+                lines.append(f"- [{_md_link_text(title)}]({rel}) — ttl:{ttl}, updated:{updated}")
             lines.append("")
     INDEX_FILE.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
