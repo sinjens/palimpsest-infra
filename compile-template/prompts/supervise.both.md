@@ -10,10 +10,10 @@ The human gatekeeper is intentionally out of the loop. Your edits land directly.
    - **Confirm** `share: true` on articles that are genuinely broadly applicable (patterns, architectural decisions, tool choices, debugging techniques that would help other engineers).
    - **Add** `share: true` if a private-flagged article is actually general-purpose technical content. Most `both` articles should carry this flag.
    - **Strip** `share: true` only when content is truly about the author's personal workflow, idiosyncratic tooling, or meta-observations that wouldn't transfer. Err toward sharing.
-2. **Contradictions** — two articles claiming opposite facts about the same thing. Reconcile: rewrite whichever is wrong (or both, if nuance was lost). Cite specifics in the reason.
+2. **Contradictions / superseded claims** — an article asserts something a newer article (or a later recorded event: a fix that recurred, a decision reversed) shows to be false or superseded. Reconcile: rewrite the stale claim, or mark it superseded naming what replaced it. A shown article reading as currently-true but isn't is worse than an incomplete one. **Always in scope, regardless of TTL.** Cite specifics in the reason.
 3. **Redundancies** — two articles covering substantially the same ground. Merge: rewrite one as the canonical, delete the other, ensure inbound links are updated (by rewriting the linker).
 4. **Thin content** — an article that's three bullets and a vague context section. Delete, or merge into a fuller sibling. Don't keep low-signal entries in `both` — the bar here is the highest.
-5. **Stale content** — articles whose `updated` frontmatter + TTL has elapsed, AND whose content is demonstrably out of date given newer articles or synthesis. Rewrite with the new information; bump `updated` to today.
+5. **Stale content (TTL)** — an expired TTL is a reason to re-examine an article, not a precondition for fixing a falsehood (rule 2, un-gated). Refresh if still accurate (bump `updated`), rewrite if drifted, delete if obsolete.
 6. **Missing backlinks** — article A mentions the topic article B covers but doesn't `[[link]]` to it. Rewrite A to add the link.
 7. **Organization** — if 3+ articles cluster around a single project or product, consider moving them into a `projects/<slug>/` folder. Use the `move` action (emit a create at the new path + a delete at the old path, and rewrite any linker).
 
@@ -22,10 +22,10 @@ The human gatekeeper is intentionally out of the loop. Your edits land directly.
 You'll receive an incremental review scope:
 
 1. The palimpsest index (TOC of ALL articles), for awareness.
-2. The full text of tonight's review set only — articles changed since the last supervisor pass, their `related:` neighbours, automated flags (TTL expiry, GDPR screen), and a rotating audit shard. Each carries its review reason.
+2. The full text of tonight's review set only — articles changed since the last supervisor pass, their `related:` neighbours (both directions), automated flags (TTL expiry, GDPR screen), findings carried over from earlier passes, and a rotating audit shard. Each carries its review reason.
 3. Today's date, so you can compute TTL elapsed time.
 
-You may only rewrite or delete articles shown in full — edits to articles you know only from the TOC are dropped by the pipeline. If a shown article duplicates or contradicts an unshown one, describe it in the summary instead. No raw logs in this pass — that's synthesis's job.
+You may only rewrite or delete articles shown in full — edits to articles you know only from the TOC are dropped by the pipeline. If a shown article duplicates, contradicts, or supersedes an article you can only see in the TOC, **emit a `@@@FOLLOWUP` block** (below) so a later pass pulls it into full review and acts on it — do NOT bury the finding in the summary, which is not re-read. No raw logs in this pass — that's synthesis's job.
 
 ## Your output — delimited blocks, NOT JSON
 
@@ -87,6 +87,19 @@ reason: moved from patterns/, updated body header
 ```
 
 (A `create` at a path that doesn't exist will be treated as a new article — use for the move target or for emergent topics discovered during review.)
+
+### followup (a finding about an article NOT shown in full this pass)
+
+Use when the TOC or a shown article reveals some OTHER article — one you can't
+see in full and must not edit — is stale, contradicted, superseded, or a
+duplicate. It gets queued and pulled into a later review.
+
+```
+@@@FOLLOWUP
+path: palimpsest/patterns/some-unshown-article.md
+reason: contradicted by the pattern updated in canonical-article.md today; likely superseded
+@@@END
+```
 
 ### skip
 

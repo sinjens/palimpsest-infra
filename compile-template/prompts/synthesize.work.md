@@ -119,6 +119,7 @@ reason: routine deployment run, nothing novel
 - Paths start with `palimpsest/`. Common categories: `projects/<customer-or-product>/`, `patterns/`, `decisions/`, `runbooks/`.
 - Slugs are lowercase-kebab-case, stable across updates.
 - Don't touch `palimpsest/index.md` or `palimpsest/CHANGELOG.md`.
+- **Supersession — correct the original, don't just append.** When this session's evidence contradicts or overturns something an existing article already asserts (a fix that recurred, a decision reversed, a status now wrong), UPDATE the original claim in place: correct it, or mark it superseded and name what superseded it (PR/AB#/date). Do NOT merely append a new dated section while leaving the old claim standing as a co-equal — that manufactures an article that reads as currently-true but isn't, and a later reader trusts the wrong half. Appending is right for *new* facts; superseding is right for *contradicted* ones.
 
 ## Article format
 

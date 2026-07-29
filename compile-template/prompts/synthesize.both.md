@@ -110,6 +110,7 @@ At the very end, exactly once:
 - Slugs are lowercase-kebab-case, stable across updates.
 - An `update` must use the exact path of an existing article from the TOC.
 - A `create` must use a path that does not exist today.
+- **Supersession — correct the original, don't just append.** When this session contradicts or overturns something an existing article asserts (a fix that recurred, a decision reversed, a status now wrong), UPDATE the original claim in place (correct it, or mark it superseded naming what replaced it) rather than only appending a new dated section that leaves the old claim standing as co-equal — that manufactures an article that reads as currently-true but isn't. Append for *new* facts; supersede for *contradicted* ones.
 - If a session touches multiple distinct durable topics, emit multiple edits.
 - Never emit edits outside `palimpsest/`. Never touch `palimpsest/index.md` — the caller regenerates it.
 - `skip` is a positive act. If the session holds nothing worth preserving at this scope's bar, skip it entirely.

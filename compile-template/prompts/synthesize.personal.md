@@ -72,6 +72,7 @@ reason: routine debugging of a typo, nothing novel to capture
 - Project folders accumulate freely — create them as soon as a project has a first article.
 - An `update` must target an existing path; a `create` must use a fresh path.
 - Slugs are lowercase-kebab-case, stable across updates.
+- **Supersession — correct the original, don't just append.** When this session contradicts or overturns something an existing article asserts, UPDATE the original claim in place (correct it, or mark it superseded naming what replaced it) rather than only appending a new dated section that leaves the old claim standing as co-equal. Append for *new* facts; supersede for *contradicted* ones.
 - Never emit edits outside `palimpsest/`. Never touch `index.md` or `CHANGELOG.md`.
 
 ## Article format

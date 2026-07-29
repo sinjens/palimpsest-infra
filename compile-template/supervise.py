@@ -27,6 +27,7 @@ Usage:
 """
 import argparse
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -86,6 +87,16 @@ SUPERVISE_PROMPT_FILE = COMPILE_DIR / "prompts" / "supervise.md"
 # changed after it. Committed alongside the supervisor's edits so every
 # checkout (and the routine container) shares the same review frontier.
 STATE_FILE = COMPILE_DIR / "supervise-state.txt"
+# Durable cross-pass findings queue. When the supervisor spots that an
+# UNSHOWN article contradicts reality (per the TOC) it can't edit it — the
+# blind-edit guard forbids editing unseen content — so it emits a @@@FOLLOWUP
+# instead. Those land here (keyed by path) and are re-seeded into the review
+# set on later nights until the article is shown AND edited. Without this the
+# finding dead-ended in the changelog and nothing ever picked it up.
+FOLLOWUPS_FILE = COMPILE_DIR / "followups.json"
+# A queued finding still unresolved after this many reviews is surfaced loudly
+# (needs a human, or is a false positive) rather than looping silently.
+FOLLOWUP_ESCALATE_AFTER = max(1, int(os.environ.get("PALIMPSEST_FOLLOWUP_ESCALATE_AFTER", "3") or "3"))
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 SUPERVISOR_MODEL = os.environ.get("PALIMPSEST_SUPERVISOR_MODEL", "opus")
@@ -175,15 +186,31 @@ def invoke_supervisor(prompt: str) -> str:
 
 
 def parse_supervise_response(text: str) -> dict:
-    """Parse @@@SUPERVISE / @@@SUMMARY blocks. Mirrors main.parse_delimited_response
-    but with a different block marker."""
+    """Parse @@@SUPERVISE / @@@FOLLOWUP / @@@SUMMARY blocks. @@@FOLLOWUP (path +
+    reason, no body) records a finding about an article NOT shown in full this
+    pass, to be re-seeded into a later review via the followups queue."""
     edits: list[dict] = []
+    followups: list[dict] = []
     summary = ""
     lines = text.splitlines()
     i = 0
     while i < len(lines):
         line = lines[i].rstrip()
-        if line == "@@@SUPERVISE":
+        if line == "@@@FOLLOWUP":
+            header = {}
+            i += 1
+            while i < len(lines) and lines[i].rstrip() != "@@@END":
+                raw = lines[i]
+                if ":" in raw:
+                    k, _, v = raw.partition(":")
+                    header[k.strip()] = v.strip()
+                i += 1
+            if i < len(lines) and lines[i].rstrip() == "@@@END":
+                i += 1
+            p = header.get("path", "")
+            if p.startswith("palimpsest/"):
+                followups.append({"path": p, "reason": header.get("reason", "")})
+        elif line == "@@@SUPERVISE":
             header: dict[str, str] = {}
             body: str | None = None
             i += 1
@@ -222,23 +249,22 @@ def parse_supervise_response(text: str) -> dict:
         else:
             i += 1
     if not edits:
-        if summary:
-            # LLM emitted @@@SUMMARY but no @@@SUPERVISE blocks. Treat as
-            # implicit skip: the summary tells us what the reviewer
-            # noticed (if anything), and the retry path is for
-            # empty/malformed responses, not for "model described the
-            # action but forgot to wrap it in a block".
+        if summary or followups:
+            # No @@@SUPERVISE edits, but the reviewer said something (a summary
+            # and/or followups about unshown articles). Treat as an implicit
+            # skip on the edit side while preserving the followups.
             return {
                 "edits": [{
                     "action": "skip",
-                    "reason": f"implicit skip (summary-only response): {summary[:200]}",
+                    "reason": f"implicit skip (no edit blocks): {summary[:200]}",
                 }],
                 "session_summary": summary,
+                "followups": followups,
             }
         raise ValueError(
             "No @@@SUPERVISE blocks found in response. First 500 chars:\n" + text[:500]
         )
-    return {"edits": edits, "session_summary": summary}
+    return {"edits": edits, "session_summary": summary, "followups": followups}
 
 
 def apply_supervise_edits(
@@ -304,6 +330,28 @@ def read_state() -> str | None:
         return lines[0].strip() or None
     except (OSError, IndexError):
         return None
+
+
+def read_followups() -> list[dict]:
+    """Load the cross-pass findings queue. Each entry:
+    {path, reason, first_flagged, passes_seen}. Missing/corrupt -> []."""
+    try:
+        data = json.loads(FOLLOWUPS_FILE.read_text(encoding="utf-8"))
+        return [e for e in data if isinstance(e, dict) and e.get("path", "").startswith("palimpsest/")]
+    except (OSError, ValueError):
+        return []
+
+
+def write_followups(queue: list[dict]) -> None:
+    """Persist the queue; an empty queue removes the file so a clean state
+    leaves no artefact."""
+    try:
+        if queue:
+            FOLLOWUPS_FILE.write_text(json.dumps(queue, indent=2) + "\n", encoding="utf-8")
+        elif FOLLOWUPS_FILE.exists():
+            FOLLOWUPS_FILE.unlink()
+    except OSError:
+        pass
 
 
 def dirty_articles(since_sha: str, articles: list[Path]) -> list[Path]:
@@ -376,21 +424,23 @@ def _est_tokens(path: Path) -> int:
         return 1
 
 
-def select_review_set(articles: list[Path], today: date) -> tuple[dict[Path, set[str]], dict]:
+def select_review_set(
+    articles: list[Path], today: date, followups: list[dict] | None = None
+) -> tuple[dict[Path, set[str]], dict]:
     """Assemble tonight's review set under REVIEW_TOKEN_BUDGET, in priority
     order so the single Opus call is always bounded:
 
         1. automated flags — GDPR (email-like strings) + TTL expiry
-        2. changed-since-last-review (the dirty set)
-        3. `related:` neighbours of dirty articles
-        4. rotating audit window — fills whatever budget remains
+        2. followups — findings a prior pass flagged but couldn't action
+        3. changed-since-last-review (the dirty set)
+        4. neighbours of dirty — BOTH directions: articles a dirty one points
+           at (`related:`), AND articles that point at / mention a dirty one
+        5. rotating audit window — fills whatever budget remains
 
     Insertion stops adding a tier's articles once the budget is hit; anything
     that didn't fit is DEFERRED, not lost — the frontier still advances (see
     main), so deferred dirty articles get their coherence pass on their audit
-    night instead. On a normal night the whole dirty set fits and nothing is
-    deferred; deferral only kicks in during a backlog/spike, which is exactly
-    when an unbounded review would otherwise stall. Returns (shown, stats)."""
+    night instead. Returns (shown, stats)."""
     shown: dict[Path, set[str]] = {}
     used = 0
 
@@ -414,7 +464,16 @@ def select_review_set(articles: list[Path], today: date) -> tuple[dict[Path, set
         print("No supervise state yet — bootstrapping incremental review "
               "(the audit rotation covers the backlog).")
 
-    # 1. flags first — cheap and important (compliance / freshness)
+    dirty_set = set(dirty)
+    dirty_slugs = {a.stem for a in dirty}
+    # One regex to test whether some other article mentions ANY changed slug —
+    # in its `related:` list or its body. This is the INBOUND neighbour edge:
+    # an article that references a changed one but isn't referenced by it would
+    # otherwise never enter review (the old expansion was outbound-only).
+    slug_re = re.compile("|".join(re.escape(s) for s in dirty_slugs)) if dirty_slugs else None
+
+    # Single read pass over the library: TTL flags + inbound-neighbour detection.
+    inbound: list[Path] = []
     for a in articles:
         try:
             text = a.read_text(encoding="utf-8")
@@ -422,21 +481,35 @@ def select_review_set(articles: list[Path], today: date) -> tuple[dict[Path, set
             continue
         if ttl_expired(text, today):
             add(a, "ttl expired")
+        if slug_re is not None and a not in dirty_set and slug_re.search(text):
+            inbound.append(a)
+    # GDPR screen on the dirty set (reads are cheap; keep it scoped to changes)
     for a in dirty:
         try:
             if _EMAIL_RE.search(a.read_text(encoding="utf-8")):
                 add(a, "automated GDPR screen: contains an email-like string")
         except OSError:
             pass
-    # 2. dirty set (oldest change first — git diff order); count deferrals
+
+    by_rel = {a.relative_to(BRAIN_ROOT).as_posix(): a for a in articles}
+
+    # 2. followups — durable findings from earlier passes, high priority
+    for entry in (followups or []):
+        a = by_rel.get(entry.get("path", ""))
+        if a:
+            add(a, f"flagged by a previous pass ({entry.get('passes_seen', 0) + 1}x): {entry.get('reason','')[:80]}")
+
+    # 3. dirty set (oldest change first — git diff order); count deferrals
     deferred = 0
     for a in dirty:
         if not add(a, "changed since last review"):
             deferred += 1
-    # 3. related neighbours of dirty
+    # 4. neighbours — outbound (dirty -> its related:) then inbound (-> dirty)
     for a in related_neighbors(dirty, articles):
         add(a, "related to a changed article")
-    # 4. audit fills the remaining budget
+    for a in inbound:
+        add(a, "references a changed article")
+    # 5. audit fills the remaining budget
     for a in audit_rotation(articles, today):
         add(a, "scheduled audit shard")
 
@@ -541,9 +614,19 @@ def update_supervise_changelog(edits: list[tuple[str, str]], summary: str) -> No
 
 
 def git_commit_supervise(summary: str) -> bool:
+    add_paths = ["palimpsest", "compile/supervise-state.txt"]
+    # Stage followups.json when it exists (content) OR is tracked (so an
+    # emptied-and-deleted queue gets its deletion staged). `git add` errors
+    # only on a path that neither exists nor is tracked — the first-ever run.
+    tracked = subprocess.run(
+        ["git", "-C", str(BRAIN_ROOT), "ls-files", "--error-unmatch",
+         "compile/followups.json"],
+        capture_output=True,
+    ).returncode == 0
+    if FOLLOWUPS_FILE.exists() or tracked:
+        add_paths.append("compile/followups.json")
     subprocess.run(
-        ["git", "-C", str(BRAIN_ROOT), "add", "palimpsest",
-         "compile/supervise-state.txt"],
+        ["git", "-C", str(BRAIN_ROOT), "add", *add_paths],
         check=True,
     )
     diff = subprocess.run(
@@ -579,10 +662,18 @@ def main() -> int:
     # night instead of slipping through the gap.
     head = head_sha()
 
-    shown, stats = select_review_set(articles, today)
+    # Load the cross-pass findings queue and prune entries whose article was
+    # since deleted, then seed them into tonight's review.
+    existing = {a.relative_to(BRAIN_ROOT).as_posix() for a in articles}
+    followups = [e for e in read_followups() if e.get("path") in existing]
+
+    shown, stats = select_review_set(articles, today, followups)
     if not shown:
         print("Nothing to review tonight (no changes since last pass, no "
               "flags, audit rotation disabled) — skipping the model call.")
+        # Prune any followups whose article vanished; otherwise nothing to do.
+        if len(followups) != len(read_followups()):
+            write_followups(followups)
         return 0
 
     reason_counts: dict[str, int] = {}
@@ -649,6 +740,32 @@ def main() -> int:
     applied = apply_supervise_edits(response, shown_rels)
     for action, identifier in applied:
         print(f"  {action:<7}  {identifier}")
+
+    # Update the followups queue: findings actioned this pass drop out; those
+    # shown but not acted on age (and escalate loudly past the threshold); new
+    # findings the reviewer emitted this pass are enqueued. This is what turns
+    # detection of an unshown contradiction into eventual action.
+    edited = {p for (act, p) in applied if act in ("rewrite", "delete", "create")}
+    queue: list[dict] = []
+    for e in followups:
+        if e["path"] in edited:
+            continue  # resolved
+        if e["path"] in shown_rels:
+            e["passes_seen"] = int(e.get("passes_seen", 0)) + 1
+            if e["passes_seen"] >= FOLLOWUP_ESCALATE_AFTER:
+                print(f"  WARNING: followup unresolved after {e['passes_seen']} "
+                      f"review(s) — {e['path']}: {e.get('reason','')}", file=sys.stderr)
+        queue.append(e)
+    have = {e["path"] for e in queue}
+    for f in response.get("followups", []):
+        p = f.get("path", "")
+        if p and p in existing and p not in have and p not in edited:
+            queue.append({"path": p, "reason": f.get("reason", ""),
+                          "first_flagged": today.isoformat(), "passes_seen": 0})
+            have.add(p)
+    write_followups(queue)
+    if queue:
+        print(f"  followups queue: {len(queue)} open finding(s)")
 
     update_supervise_changelog(applied, summary)
     compile_main.regenerate_index()
