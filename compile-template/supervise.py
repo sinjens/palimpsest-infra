@@ -94,9 +94,12 @@ STATE_FILE = COMPILE_DIR / "supervise-state.txt"
 # set on later nights until the article is shown AND edited. Without this the
 # finding dead-ended in the changelog and nothing ever picked it up.
 FOLLOWUPS_FILE = COMPILE_DIR / "followups.json"
-# A queued finding still unresolved after this many reviews is surfaced loudly
-# (needs a human, or is a false positive) rather than looping silently.
+# A queued finding that can't even be SHOWN (budget-starved) this many nights
+# running is dropped with a loud warning rather than lingering forever.
 FOLLOWUP_ESCALATE_AFTER = max(1, int(os.environ.get("PALIMPSEST_FOLLOWUP_ESCALATE_AFTER", "3") or "3"))
+# Hard ceiling on how many followups enter one night's review, so a stuck or
+# bursty queue can never monopolise the budget and starve dirty/audit.
+FOLLOWUP_MAX_PER_NIGHT = max(1, int(os.environ.get("PALIMPSEST_FOLLOWUP_MAX_PER_NIGHT", "12") or "12"))
 
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 SUPERVISOR_MODEL = os.environ.get("PALIMPSEST_SUPERVISOR_MODEL", "opus")
@@ -493,17 +496,22 @@ def select_review_set(
 
     by_rel = {a.relative_to(BRAIN_ROOT).as_posix(): a for a in articles}
 
-    # 2. followups — durable findings from earlier passes, high priority
-    for entry in (followups or []):
-        a = by_rel.get(entry.get("path", ""))
-        if a:
-            add(a, f"flagged by a previous pass ({entry.get('passes_seen', 0) + 1}x): {entry.get('reason','')[:80]}")
-
-    # 3. dirty set (oldest change first — git diff order); count deferrals
+    # 2. dirty set (the real new work — never starve it); count deferrals
     deferred = 0
     for a in dirty:
         if not add(a, "changed since last review"):
             deferred += 1
+    # 3. followups — durable findings from earlier passes, but CAPPED at
+    #    FOLLOWUP_MAX_PER_NIGHT so a stuck queue can never again monopolise the
+    #    review and starve the audit rotation (it once grew to ~42 items eating
+    #    95% of the budget, crushing the audit from 30 to 1 article/night).
+    followups_shown = 0
+    for entry in (followups or []):
+        if followups_shown >= FOLLOWUP_MAX_PER_NIGHT:
+            break
+        a = by_rel.get(entry.get("path", ""))
+        if a and add(a, f"flagged by a previous pass ({entry.get('passes_seen', 0) + 1}x): {entry.get('reason','')[:80]}"):
+            followups_shown += 1
     # 4. neighbours — outbound (dirty -> its related:) then inbound (-> dirty)
     for a in related_neighbors(dirty, articles):
         add(a, "related to a changed article")
@@ -517,6 +525,7 @@ def select_review_set(
         "total_articles": len(articles),
         "dirty_total": len(dirty),
         "deferred": deferred,
+        "followups_shown": followups_shown,
         "est_tokens": used,
     }
     return shown, stats
@@ -741,31 +750,43 @@ def main() -> int:
     for action, identifier in applied:
         print(f"  {action:<7}  {identifier}")
 
-    # Update the followups queue: findings actioned this pass drop out; those
-    # shown but not acted on age (and escalate loudly past the threshold); new
-    # findings the reviewer emitted this pass are enqueued. This is what turns
-    # detection of an unshown contradiction into eventual action.
+    # Update the followups queue. CLEAR-ON-SHOWN: a followup's whole purpose is
+    # to get an unshowable article INTO a full review; once shown, it's been
+    # adjudicated — drop it whether or not an edit resulted (many are soft
+    # "verify current state" flags that, seen in full, need no change). If a
+    # real issue persists the reviewer re-emits a fresh followup. Only items
+    # that couldn't even be SHOWN (budget-starved, capped out) age; one that
+    # can't get shown after N nights is dropped with a loud warning. Previously
+    # this cleared only on EDIT and re-showed unedited items forever, which let
+    # the queue grow to ~42 stuck items monopolising the review.
     edited = {p for (act, p) in applied if act in ("rewrite", "delete", "create")}
     queue: list[dict] = []
+    adjudicated = starved = 0
     for e in followups:
-        if e["path"] in edited:
-            continue  # resolved
-        if e["path"] in shown_rels:
-            e["passes_seen"] = int(e.get("passes_seen", 0)) + 1
-            if e["passes_seen"] >= FOLLOWUP_ESCALATE_AFTER:
-                print(f"  WARNING: followup unresolved after {e['passes_seen']} "
-                      f"review(s) — {e['path']}: {e.get('reason','')}", file=sys.stderr)
+        if e["path"] in edited or e["path"] in shown_rels:
+            adjudicated += 1
+            continue  # resolved (edited) or reviewed-and-declined (shown) — done
+        # Not shown this pass (budget/cap starved it). Age it; give up loudly
+        # if it can never win a slice.
+        e["passes_seen"] = int(e.get("passes_seen", 0)) + 1
+        if e["passes_seen"] >= FOLLOWUP_ESCALATE_AFTER:
+            print(f"  WARNING: dropping followup unresolved after {e['passes_seen']} "
+                  f"nights without a review slot — {e['path']}: {e.get('reason','')}", file=sys.stderr)
+            starved += 1
+            continue
         queue.append(e)
     have = {e["path"] for e in queue}
+    new = 0
     for f in response.get("followups", []):
         p = f.get("path", "")
-        if p and p in existing and p not in have and p not in edited:
+        if p and p in existing and p not in have and p not in edited and p not in shown_rels:
             queue.append({"path": p, "reason": f.get("reason", ""),
                           "first_flagged": today.isoformat(), "passes_seen": 0})
             have.add(p)
+            new += 1
     write_followups(queue)
-    if queue:
-        print(f"  followups queue: {len(queue)} open finding(s)")
+    print(f"  followups: {adjudicated} adjudicated, {new} new, "
+          f"{starved} dropped (starved); {len(queue)} carried forward")
 
     update_supervise_changelog(applied, summary)
     compile_main.regenerate_index()
